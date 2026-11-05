@@ -686,7 +686,7 @@ function renderNew(main) {
   const choices = choosable();
   const form = { give: choices[0] ?? '', want: choices[1] ?? '', giveAmount: '', wantAmount: '' };
   const coinSelect = (name, value) => `<div class="coin-select">
-      <select id="${name}-coin" aria-label="Coin">${choosable().map((h) => {
+      <select id="${name}-coin" aria-label="Coin">${value ? '' : '<option value="" selected disabled>Pick a coin</option>'}${choosable().map((h) => {
         const c = app.coins.get(h);
         return `<option value="${h}"${h === value ? ' selected' : ''}>${esc(shownText(c.symbol, 10) ?? '?')} · ${esc(shownText(c.name, 24) ?? '?')}${c.known ? '' : ` · ${h.slice(0, 6)}…`}</option>`;
       }).join('')}<option value="add">Another coin…</option></select>
@@ -747,7 +747,7 @@ function renderNew(main) {
     const w = want ? parseAmount(form.wantAmount, want.decimals) : null;
     const preview = $('#preview', main);
     const problems = [];
-    if (!give || !want) problems.push('Pick both coins.');
+    if (!give || !want) problems.push(choosable().length < 2 ? 'Add the other coin with Another coin…, by its ContractId.' : 'Pick both coins.');
     else if (form.give === form.want) problems.push('Pick two different coins.');
     if (give && form.giveAmount && g == null) problems.push(`${esc(give.symbol)} has ${give.decimals} decimals.`);
     if (want && form.wantAmount && w == null) problems.push(`${esc(want.symbol)} has ${want.decimals} decimals.`);

@@ -281,7 +281,7 @@ main { flex: 1; width: 100%; max-width: 1180px; margin: 0 auto; padding: 32px 28
 .field-block label { font-size: .78rem; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
 .field-block .hint { margin: 0; min-height: 1.3em; }
 .amount-row { display: flex; gap: 10px; align-items: center; }
-.amount-row input { flex: 1; font-size: 1.7rem; font-weight: 600; font-family: var(--display); border: 0; background: transparent; padding: 2px 0; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.amount-row input { flex: 1 1 4ch; width: 0; font-size: 1.7rem; font-weight: 600; font-family: var(--display); border: 0; background: transparent; padding: 2px 0; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .amount-row input:focus-visible { outline: none; }
 .field-block:focus-within { border-color: color-mix(in srgb, var(--primary) 55%, transparent); box-shadow: 0 0 0 3px var(--primary-soft); }
 .coin-select select { font-weight: 600; border-radius: 999px; padding: 8px 14px; background: var(--card); max-width: 230px; }
@@ -385,7 +385,7 @@ summary { cursor: pointer; color: var(--text-2); font-size: .9rem; }
   .sign-chip span { display: none; }
   main { padding: 22px 16px 44px; }
   .hero { grid-template-columns: 1fr; gap: 22px; }
-  .detail-grid, .new-grid { grid-template-columns: 1fr; }
+  .detail-grid, .new-grid { grid-template-columns: minmax(0, 1fr); }
   .ticket { padding: 20px; border-radius: 16px; }
   .call-pay { grid-template-columns: 1fr; }
   .qr { width: min(100%, 300px); justify-self: center; }
@@ -401,6 +401,12 @@ summary { cursor: pointer; color: var(--text-2); font-size: .9rem; }
   .legs { grid-template-columns: 1fr; }
   .swap-icon { justify-self: center; transform: rotate(90deg); }
   .stats dd { font-size: 1.35rem; }
-  .amount-row { flex-wrap: wrap; }
-  .coin-select select { max-width: 100%; }
+  .amount-row input { font-size: 1.4rem; }
+  .coin-select { min-width: 0; max-width: 58%; }
+  .coin-select select { width: 100%; max-width: 100%; text-overflow: ellipsis; }
+}
+@media (max-width: 380px) {
+  .top { gap: 2px; padding: 0 8px; }
+  .brand img { width: 26px; height: 26px; }
+  nav a { padding: 6px 5px; font-size: .82rem; }
 }
