@@ -3,3 +3,4 @@ program/target/
 .DS_Store
 .devchain.json
 .devnode/
+.claude/

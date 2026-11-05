@@ -1,10 +1,11 @@
 # Publishes web/ to GitHub Pages: the page is static and has no build, but its
-# URLs get the commit, for the browser's cache. Run by hand while the
-# repository is private; add a push trigger on main for web/** once it is
-# public and Pages is on.
+# URLs get the commit, for the browser's cache.
 name: Pages
 
 on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

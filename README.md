@@ -117,6 +117,12 @@ wrong amounts, wrong recipients, stale nonces, accounts that answer with a delay
 programs acting as their own account; and that the swap always holds exactly what
 its open listings offer.
 
+The CodeHash is that of a build on macOS or Linux: a build on Windows writes its
+source paths with `\` and gets another one. On macOS, if linking fails with
+`unknown architecture arm64e.x1-macos`, the command-line tools' newest SDK is ahead
+of their linker: `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`
+(or the SDK matching the system) fixes it.
+
 ## A development chain
 
 A node of its own, with its own ports, beside any other node:
@@ -144,7 +150,9 @@ identity's Savings account is refused. Stop the miner and the node when done:
 
 ## Deploying
 
-The swap is not deployed on the production network yet.
+The swap runs on the production network as
+`e5376baad8ced3b25f2c09f3687270b3b86ef275718828b35f195afd1e983b77`, CodeHash
+`97fdffbedaff0aa485e5536f089fe3306436ae54b8ed6691b3641bad9af0f1e0`.
 
 ```sh
 node scripts/deploy.mjs
@@ -157,8 +165,8 @@ never change; another version is another deployment, with another ContractId.
 ## Hosting
 
 `web/` is the whole site. `.github/workflows/pages.yml` publishes it to GitHub Pages
-when run by hand (Settings → Pages → Source: GitHub Actions); it can run on every push
-once the repository is public. Any static host works the same way. The page talks to
+on every push to `main` that changes it (Settings → Pages → Source: GitHub Actions).
+Any static host works the same way. The page talks to
 `https://node1.ting-node.com` by default, which answers browsers from any origin;
 `?node=<url>&swap=<id>&coins=<id>,<id>` points it elsewhere and names more coins as
 known.
