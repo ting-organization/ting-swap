@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ting Swap</title>
+  <meta name="description" content="Swap coins on the Ting chain: list what you give and what you want, and anyone can take it with Ting ID.">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/"><img src="icon.svg" alt="" width="30" height="30"><span>Ting Swap</span></a>
+    <nav>
+      <a href="#/" data-nav="market">Market</a>
+      <a href="#/new" data-nav="new"><span class="long">New listing</span><span class="short">List</span></a>
+      <a href="#/activity" data-nav="activity">Activity</a>
+      <a href="#/about" data-nav="about"><span class="long">How it works</span><span class="short">About</span></a>
+    </nav>
+    <span class="network" id="network"></span>
+    <button class="icon-button" id="theme" aria-label="Switch light and dark" title="Switch light and dark"></button>
+    <button class="sign-chip" id="sign-chip">Ting ID</button>
+  </header>
+  <main id="view"><section class="notice"><span class="spinner big"></span><p class="muted">Reading the chain…</p></section></main>
+  <footer class="foot">
+    <span>Ting Swap · a program on the Ting chain · the page holds no key and no coins</span>
+  </footer>
+  <dialog id="sign-dialog" aria-label="Signing">
+    <button class="close" aria-label="Close">×</button>
+    <div class="dialog-body"></div>
+  </dialog>
+  <dialog id="call-dialog" aria-label="Sign with Ting ID">
+    <button class="close" aria-label="Close">×</button>
+    <div class="dialog-body"></div>
+  </dialog>
+  <div id="toasts" aria-live="polite"></div>
+  <noscript><p class="notice">Ting Swap needs JavaScript: it reads the chain and makes call links for your wallet.</p></noscript>
+</body>
+</html>

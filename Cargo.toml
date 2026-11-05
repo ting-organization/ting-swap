@@ -1,0 +1,5 @@
+[workspace]
+members = ["tools"]
+# Built for wasm32v1-none on its own: see build.sh.
+exclude = ["program"]
+resolver = "3"

@@ -1,0 +1,43 @@
+# Publishes web/ to GitHub Pages: the page is static and has no build, but its
+# URLs get the commit, for the browser's cache. Run by hand while the
+# repository is private; add a push trigger on main for web/** once it is
+# public and Pages is on.
+name: Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # Pages lets a browser keep every file for ten minutes, and a reload asks
+      # anew only for the page: so the page's URLs name this commit, and a
+      # browser runs one deploy's modules, never old ones with new.
+      - name: Stamp the commit into the page's URLs
+        run: |
+          v=${GITHUB_SHA::12}
+          sed -i -E "s#(href=\"style\.css|src=\"js/app\.js)\"#\1?v=$v\"#" web/index.html
+          sed -i -E "s#from '(\./[a-z0-9]+\.js)'#from '\1?v=$v'#" web/js/*.js
+          grep -q "style.css?v=$v" web/index.html
+          grep -q "app.js?v=$v" web/index.html
+          ! grep -nE "from ['\"]\.\.?/" web/js/*.js | grep -v "?v=$v'"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - id: deployment
+        uses: actions/deploy-pages@v4

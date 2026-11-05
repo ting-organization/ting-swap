@@ -1,0 +1,16 @@
+[package]
+name = "ting-swap-tools"
+version = "0.1.0"
+edition = "2024"
+description = "Packs the swap program into a canonical module, and tests it on Ting's reference VM"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# The reference node's core, checked out beside this repository.
+ting-core = { path = "../../ting-reference" }
+wasmparser = "=0.240.0"
+wasm-encoder = { version = "=0.240.0", features = ["wasmparser"] }
+
+[dev-dependencies]
+wat = "=1.240.0"

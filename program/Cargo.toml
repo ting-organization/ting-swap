@@ -1,0 +1,20 @@
+[package]
+name = "ting-swap-program"
+version = "0.1.0"
+edition = "2024"
+description = "The Ting Swap program, built for wasm32v1-none and packed into swap.wasm"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
