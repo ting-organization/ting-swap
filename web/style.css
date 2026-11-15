@@ -389,6 +389,9 @@ dialog .close:hover { background: var(--hover); color: var(--text); border-color
 .call-sentence b { color: var(--text); }
 .call-sentence .mono { font-size: 12.5px; }
 .call-pay { display: grid; grid-template-columns: minmax(0, 200px) 1fr; gap: 20px; align-items: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+/* On a phone the dialog has no code column: the code folds away under the buttons. */
+.call-pay.android, .call-pay.ios { grid-template-columns: 1fr; }
+.pay-side details .qr { display: block; width: 200px; max-width: 100%; margin-top: 8px; }
 .pay-side .hint:first-child { margin-top: 0; }
 .pay-side .row { margin: 12px 0; }
 .waiting { display: flex; align-items: center; gap: 8px; }
