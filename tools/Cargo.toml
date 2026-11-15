@@ -2,7 +2,7 @@
 name = "ting-swap-tools"
 version = "0.1.0"
 edition = "2024"
-description = "Packs the swap program into a canonical module, and tests it on Ting's reference VM"
+description = "Packs the swap and HTLC programs into canonical modules, and tests them on Ting's reference VM"
 license = "MIT OR Apache-2.0"
 publish = false
 

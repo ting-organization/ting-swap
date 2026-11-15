@@ -1,102 +1,109 @@
 # Ting Swap
 
-Swap coins on [Ting](https://github.com/ting-organization/ting), one listing at a
-time. A listing says *I give this much of one coin for that much of another.* Its
-maker's coins wait in the swap program until someone takes the listing with Ting ID,
-paying the maker and getting the coins in the same transaction, or until the maker
-withdraws it and has them back.
+Trade DLR on [Ting](https://github.com/ting-organization/ting) for LTC on Litecoin,
+with nobody sending first. The buyer locks the LTC on Litecoin under the hash of a
+secret only their page knows; the seller's page checks the lock and the seller locks
+the DLR on Ting for that buyer under the same hash. The buyer's page claims the DLR,
+which reveals the secret, and the seller's page uses it to claim the LTC. If anything
+stalls, each side gets its coins back after a deadline. No server sits in between,
+and nobody holds anyone's coins: a program on Ting and a script on Litecoin do.
 
-It is not an exchange with an order book that matches orders: there are no partial
-fills, no deposits and no balances in the program. Each listing holds exactly its
-own coins, and is taken whole or not at all.
+**It is new.** The program runs on Ting's production network, and the page, opened as
+it is, trades real DLR for real LTC on Litecoin mainnet: start with small amounts.
+Opened with a test setup's address, it runs on the Ting development chain and Litecoin
+regtest instead; see *A test setup* below to run a whole trade on your computer.
 
-It is two pieces:
+It is three pieces:
 
-- **The swap program** (`program/`, built to `swap.wasm`): a Ting program that keeps
-  the listings, holds what they offer, and settles each trade.
-  [SPEC.md](SPEC.md) states its rules.
+- **The HTLC program** (`htlc/`, built to `htlc.wasm`): listings, locks, claims and
+  refunds on Ting. It never sees Litecoin. [HTLC.md](HTLC.md) states its rules, the
+  Litecoin script and what the page does.
+- **The Litecoin side** (`web/js/ltc.js`, `web/js/secp256k1.js`): the lock's script and
+  address, and the claim, refund and release transactions, built and signed in the
+  browser, with no third-party code.
 - **The page** (`web/`): a static web client, plain HTML, CSS and JavaScript with no
-  build step and no third-party code, that reads the chain from a node and hands each
-  action to Ting ID as a call link. It holds no key and no coins, and can be hosted
-  anywhere, GitHub Pages included.
+  build step and no third-party code. It reads Ting from a node and Litecoin from an
+  Esplora-style explorer, keeps each trade's Litecoin key and secret in the browser,
+  and hands each Ting action that needs a signature to Ting ID as a TCR-1 call link.
 
-Every action is a call of [TCR-1](../ting-id/TCR-1.md), Ting Call Requests: a
-sentence in the program's own words, signed by the account that acts. The page and
-the scripts share TCR-1's modules with [Ting Canvas](https://github.com/ting-organization/ting-canvas).
+The repository also holds **the on-chain swap program** (`program/`, `swap.wasm`,
+[SPEC.md](SPEC.md)): coin-for-coin listings on Ting itself, deployed on the production
+network. Its page is set aside for now and may come back beside this one; the last
+version of it is in this repository's history, in `web/js/app.js` before the Litecoin
+page replaced it.
+
+## A trade
+
+| Step | Who | What |
+|---|---|---|
+| List | Seller, in Ting ID | The DLR go into the program, with the LTC wanted, the seller's Litecoin key for this trade, and the network fee the buyer's claim will pay |
+| Lock | Buyer | Pays the LTC from their own Litecoin wallet to an address only this trade uses; their page posts the take on Ting by itself, with no signature and no fee |
+| Accept | Seller, in Ting ID | Once their page has checked the lock on Litecoin, the DLR are held for that buyer for the lock window |
+| Claim the DLR | Buyer's page, by itself | Reveals the secret; the DLR go to the buyer, less the listing's fee |
+| Claim the LTC | Seller's page, by itself | Uses the secret to take the LTC to the seller's address |
+
+The seller's deadline on Ting always ends at least 6 hours before the buyer's lock on
+Litecoin does, so the seller has time to claim after the secret appears. A seller who
+accepts one buyer's lock, or withdraws the listing, has their page release every other
+lock at once, so that those buyers take their LTC back without waiting.
 
 ## Why it works this way
 
-**One signature a listing.** Listing pays what it offers into the swap's own
-account. The payment is a coin transfer bound to the one operation it pays for (a
-*bound action*, wiki: programs/conventions), so the coin's check of its signature is
-also the approval: Ting ID signs once, and the payment can never be spent on anything
-else.
+**The lock names the trade.** The Litecoin script carries a tag of the program, the
+listing and the buyer's Ting account. The seller's page rebuilds the address from what
+the take says and finds the LTC there, or refuses it: a copied take that names another
+account points at an address with nothing in it, and one lock cannot serve two
+listings. So the take needs no signature.
 
-**The taker pays the maker directly.** Taking a listing carries a payment from the
-taker's account straight to the maker's, of exactly what the listing asks; the
-program then hands the taker the listed coins from its own account. Both happen in
-one call: if the listing was taken or withdrawn a moment before, the whole
-transaction fails and nothing is paid. The values of a take include what the taker
-gets, so Ting ID shows both sides before anyone approves: what leaves the account on
-its own line, which it checks itself, and what comes back in the program's words.
+**The buyer needs no DLR.** The claim is sent by the buyer's page with no wallet. The
+program pays its network fee out of the locked DLR: the listing's fee, which the
+seller's page sets at three times what a claim pays now and the seller approves with
+the offer. A claim pays exactly that fee, so a miner that puts in its own copy of the
+claim gets that fee and nothing more. The program refuses a fee above a thousandth of
+the coins, and the buyer's page shows the fee, and what the buyer will receive, before
+they lock.
 
-**Only the maker withdraws.** Until a listing is taken, its maker can take it down
-and have the coins back to the same account. Nobody else can, and nothing else moves
-them. A withdrawal moves no coins of the maker's, so it takes a *fee payment*, a
-transfer of 0 to the swap's account that pays the miner, or a plain signature.
-
-**Accounts with a time lock are refused.** A Ting ID Savings account makes
-everything wait for its delay, so that a stolen key cannot empty it at once. A trade
-cannot wait a week, so the swap does not schedule: it refuses an account whose policy
-answers with a delay, outright, and the coin already refuses such an account's bound
-payments. List and take from a Spending account.
-
-**Coins name themselves.** Anyone can deploy a coin of Ting's coin program and call
-it anything, Daler included. The program trades any coin of that program, which it
-checks by CodeHash, and nothing else: a contract that only claims to be a coin could
-report a payment it never made. The page marks the coins it knows, warns about the
-others, shows every coin's ContractId, and marks a coin that copies a known coin's
-symbol as an imitation.
+**The amounts read as amounts.** TCR-1 shows an integer as it is, so the offer states
+the LTC as whole coins and eight one-digit fields: Ting ID shows *Sell 10 DLR for
+0.50000000 LTC*.
 
 **The page trusts nothing it can check.** Before it makes a call link it checks the
-CodeHash of the swap program against the code it was written for, and of every coin
-against the coin program's, and that the program lists the templates it makes links
-for.
+program's CodeHash and template list and the coin's CodeHash. Before accepting it checks
+the lock on Litecoin itself: the script, the amount, the confirmations, that it is
+unspent and lasts long enough. Before claiming it checks that the accept names this
+buyer's account, hash and lock end exactly, that the lock record on chain says the same
+and is buried deep enough, and that the deadline is far enough off for a claim to get in
+safely. Takes and releases cost nothing to post, so anyone can post them: a release
+counts only when its signature verifies, and the seller's claim spends the lock it
+accepted and nothing else, so that a dust take cannot hold it back and the buyer's other
+payments stay theirs. A seller's page follows every listing made with its key, copies
+included. Each trade's automatic steps run whatever page view is open.
 
-## Signing
+**Keys live in the browser.** Each trade's Litecoin key and secret derive from one seed
+kept in the browser; its backup code finds the trades again in another browser.
+Discord's in-app browser can lose what a page stores, so the page asks to be opened in
+the real browser first.
 
-The page holds no key and no coins: a wallet signs. Each action becomes a
-`ting:call` link, as a QR code or a link to open on the phone, its values compressed
-as `zvalues` whenever that is shorter. Ting ID shows the action in the program's
-words and what leaves the account, signs it with the account the user picks, and
-submits it; the page finds the operation in the program's *executed* events and
-follows it there. A withdrawal's link carries `from`, so only the maker's account can
-sign it, and `coin`, Daler, so that Ting ID can approve it with a fee payment. Each
-link also carries the page's address as `return`.
-
-**Your accounts.** Without a key the page still knows who you are if you let it: it
-remembers your accounts' addresses in the browser, shows them as *you*, marks your
-listings and offers to withdraw them. An account is linked when the page sees a call
-it made a link for go through, or when Ting ID sends one back through `return`; the
-Ting ID button adds or removes one by hand. An address proves nothing and signs
-nothing; it only changes what the page shows.
-
-Ting ID is the wallet that reads these links today; any wallet that implements
-TCR-1 does the same, with nothing to change in the page. On a development chain
-`scripts/tcr-wallet.mjs` stands in for one.
+**For trading over chat.** *Copy for sharing* copies an overview of the trade for a
+chat: the amounts, the LTC in dollars at litecoinspace.org's price, where the trade
+stands, and its link. It never holds a key or the secret, and the page never gives DLR
+a dollar value.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| [SPEC.md](SPEC.md) | The program's rules: coins, records, operations, events, errors, costs |
-| `program/` | The program, Rust for `wasm32v1-none`, no dependencies, with its own SHA-256 |
-| `swap.wasm` | The program as deployed, packed |
-| `tools/` | The packer, and the tests that run the program on Ting's reference VM against the real coin |
-| `web/` | The page; `web/js/tcr.js` is TCR-1 on its own, as in Ting Canvas, and `web/js/swap.js` the swap's records, calls and events |
-| `scripts/devchain.mjs` | A development chain: deploys everything, funds accounts, fills the market, runs listings end to end |
-| `scripts/tcr-wallet.mjs` | A stand-in for a TCR-1 wallet: reads a `ting:call` link, checks it against the program's template list, and completes it on a development chain |
-| `scripts/deploy.mjs` | Shows, and with `--submit` sends, the deployment on a network |
+| [HTLC.md](HTLC.md) | The HTLC program's rules, the Litecoin script and transactions, and the page |
+| `htlc/` | The HTLC program, Rust for `wasm32v1-none`, no dependencies |
+| `htlc.wasm` | The HTLC program, packed |
+| `web/` | The page: `js/ltc-app.js` the page itself, `js/htlc.js` the program's records, calls and events, `js/ltc.js` and `js/secp256k1.js` Litecoin, `js/ltc-keys.js` the seed and the trades, `js/fees.js` what a claim pays now, `js/tcr.js` TCR-1 |
+| `tools/` | The packer, and the tests that run both programs on Ting's reference VM against the real coin |
+| `scripts/test-ltc.mjs` | The Litecoin side against BIP 173/350/143, RFC 6979 and Litecoin Core's own test vectors, and every spending path checked by OpenSSL |
+| `scripts/ltc-dev.mjs` | A Litecoin regtest chain, with an Esplora-style API and a dev wallet page |
+| `scripts/htlc-dev.mjs` | The HTLC program on the Ting development chain, and the page's address for it |
+| `scripts/htlc-e2e.mjs` | Trades across both development chains, every Litecoin transaction checked by Litecoin Core |
+| [SPEC.md](SPEC.md), `program/`, `swap.wasm` | The on-chain swap program |
+| `scripts/devchain.mjs`, `scripts/tcr-wallet.mjs`, `scripts/deploy.mjs`, `scripts/chain.mjs`, `scripts/keys.mjs` | The on-chain swap program's development chain, stand-in wallet and deployment |
 | `scripts/serve.py` | Serves `web/` locally without caching |
 
 `tools/` and the scripts build against Ting's reference core and programs, checked
@@ -107,15 +114,14 @@ out beside this repository as `../ting-reference`.
 ```sh
 ./build.sh
 cargo test --release --locked -p ting-swap-tools
+node scripts/test-ltc.mjs
 ```
 
-`build.sh` compiles the program and packs it into `swap.wasm`, checked against
-Ting's execution profile; it prints the CodeHash, which `web/js/config.js` must
-match. The tests deploy two reference coins and the swap on Ting's reference VM and
-go through offers, takes and withdrawals and every way each is refused: fake coins,
-wrong amounts, wrong recipients, stale nonces, accounts that answer with a delay,
-programs acting as their own account; and that the swap always holds exactly what
-its open listings offer.
+`build.sh` compiles both programs and packs them into `htlc.wasm` and `swap.wasm`,
+checked against Ting's execution profile, and prints their CodeHashes: the page
+checks htlc.wasm's (`HTLC_CODE` in `web/js/ltc-app.js`). The VM tests go through
+every operation of each program and every way each is refused, its timing to the
+second, and that each program always holds exactly what its listings and locks do.
 
 The CodeHash is that of a build on macOS or Linux: a build on Windows writes its
 source paths with `\` and gets another one. On macOS, if linking fails with
@@ -123,53 +129,69 @@ source paths with `\` and gets another one. On macOS, if linking fails with
 of their linker: `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`
 (or the SDK matching the system) fixes it.
 
-## A development chain
+## A test setup
 
-A node of its own, with its own ports, beside any other node:
+Everything runs on your computer, on ports of its own, beside any other node:
 
-```sh
-ting --data-dir .devnode init --dev --api --control 127.0.0.1:28450 --p2p 127.0.0.1:28452 --api-bind 127.0.0.1:28451
-ting --data-dir .devnode api enable --cors
-ting --data-dir .devnode start
-ting --data-dir .devnode miner start --threads 1 --spacing 2
-node scripts/devchain.mjs setup
-```
+- **Ting:** the development chain of [Ting ID Web](https://github.com/ting-organization/ting-id-web)'s kit, checked out beside this repository, which also serves the wallet. In `../ting-id-web`:
 
-`setup` deploys the reference P-256 policy and identity registry, two test coins,
-Daler (DLR) and Test Gold (GLD), whose supply goes to a faucet, and the swap, and
-prints the page's address for them. Serve the page with `python3 scripts/serve.py`
-and open it with that query string. `node scripts/devchain.mjs demo` fills the market
-with listings from test keys, a trade, a withdrawal and a coin that imitates Daler;
-`node scripts/devchain.mjs fund <account> 5 GLD` sends an account test coins; and
-`node scripts/tcr-wallet.mjs '<link>'` completes a call link the page shows
-(`--key NAME` to act as someone else). `node scripts/devchain.mjs e2e` runs listings
-through the page's own modules with real signatures: P-256 test keys and an identity
-list, take and withdraw, links are read back as a wallet reads them, and the
-identity's Savings account is refused. Stop the miner and the node when done:
-`ting --data-dir .devnode miner stop`, `ting --data-dir .devnode stop`.
+  ```sh
+  node kit/scripts/devchain.mjs start && node kit/scripts/devchain.mjs setup
+  ./build.sh && node scripts/dev.mjs
+  python3 kit/scripts/serve.py 8766
+  ```
 
-## Deploying
+- **Litecoin:** [Litecoin Core](https://github.com/litecoin-project/litecoin/releases) unpacked into `.devltc/` (ignored by git), so that `.devltc/litecoin-*/bin/litecoind` exists. Then:
 
-The swap runs on the production network as
-`e5376baad8ced3b25f2c09f3687270b3b86ef275718828b35f195afd1e983b77`, CodeHash
-`97fdffbedaff0aa485e5536f089fe3306436ae54b8ed6691b3641bad9af0f1e0`.
+  ```sh
+  node scripts/ltc-dev.mjs start
+  node scripts/ltc-dev.mjs serve
+  ```
 
-```sh
-node scripts/deploy.mjs
-```
+  The second serves the API and a dev wallet page at <http://127.0.0.1:28472/>, with wallets `alice` and `bob`, buttons to mine blocks, and `time` to move the clock forward for refunds.
 
-shows the production deployment, and `--submit` sends it. Then put the ContractId
-it prints into `web/js/config.js`. A deployment is for good, and the program can
-never change; another version is another deployment, with another ContractId.
+- **The program and the page:**
+
+  ```sh
+  node scripts/htlc-dev.mjs setup
+  python3 scripts/serve.py 8770
+  ```
+
+  `setup` deploys `htlc.wasm` and prints the page's address, with its query string; `node scripts/htlc-dev.mjs fund <account> <DLR>` sends test DLR from the faucet. `node scripts/htlc-e2e.mjs` runs a trade, a declined lock released early, and with `--refund` a Litecoin refund after its lock ends.
+
+To trade by hand, open the page in two browsers, one for the seller and one for the
+buyer: each keeps its own keys, as two people would. The seller signs in Ting ID Web
+at <http://localhost:8766/web/>; the buyer pays from the dev wallet page.
 
 ## Hosting
 
 `web/` is the whole site. `.github/workflows/pages.yml` publishes it to GitHub Pages
 on every push to `main` that changes it (Settings → Pages → Source: GitHub Actions).
-Any static host works the same way. The page talks to
-`https://node1.ting-node.com` by default, which answers browsers from any origin;
-`?node=<url>&swap=<id>&coins=<id>,<id>` points it elsewhere and names more coins as
-known.
+Any static host works the same way. The page runs on the production network as
+`LTC_PRODUCTION` in `web/js/config.js` pins it: node1, the HTLC program
+`bc0d789dc5b7338bd19d1e7d3723ed09b09885634063bba4389f7f2b2765447d`, Daler, Litecoin
+mainnet through litecoinspace.org and Ting ID Web. `node scripts/htlc-deploy.mjs` shows
+that deployment, and `--submit` sends it. To try it before publishing,
+`python3 scripts/serve.py 8770` and open <http://localhost:8770/>.
+
+Before publishing, serve it from a domain of its own: the page keeps its keys in the
+browser, and every project page under `ting-organization.github.io` shares one origin
+(HTLC.md, *Production*).
+
+## The on-chain swap program
+
+Coin-for-coin listings on Ting: a listing's coins wait in the program until someone
+takes it, paying its maker in the same transaction, or its maker withdraws it.
+[SPEC.md](SPEC.md) states its rules, and `tools/tests/swap.rs` holds it to them. It
+runs on the production network as
+`e5376baad8ced3b25f2c09f3687270b3b86ef275718828b35f195afd1e983b77`, CodeHash
+`97fdffbedaff0aa485e5536f089fe3306436ae54b8ed6691b3641bad9af0f1e0`.
+
+`node scripts/deploy.mjs` shows its production deployment, and `--submit` sends it.
+`node scripts/devchain.mjs setup` deploys it on a development chain of its own with
+test coins (`demo` fills a market, `e2e` runs listings through with real signatures),
+and `node scripts/tcr-wallet.mjs '<link>'` completes a call link there as a wallet
+would.
 
 ## Licence
 
