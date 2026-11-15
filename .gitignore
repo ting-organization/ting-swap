@@ -1,6 +1,9 @@
 target/
 program/target/
+htlc/target/
 .DS_Store
 .devchain.json
 .devnode/
 .claude/
+.devltc/
+.htlc-dev.json
