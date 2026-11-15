@@ -727,7 +727,7 @@ function checkTake(terms, take) {
 /** What a Litecoin address starts with on this page's network, for a field's placeholder. */
 const addressHint = () => ({ mainnet: 'ltc1…', regtest: 'rltc1…' })[app.net] ?? 'tltc1…';
 
-/** The band and the footer say what the page runs on: real coins in production, or a test setup. */
+/** Production's band says only *Early testing*; a test setup's band and footer say so, and that no coin is real. */
 function markSetup() {
   if (app.production) return;
   $('.test-band').innerHTML = `<b>Test setup</b><span class="long">The Ting development chain and Litecoin ${esc(app.net)}. No coin here is real.</span><span class="short">No coin here is real.</span>`;
@@ -2731,7 +2731,7 @@ function renderAbout(main) {
       <li>Open links in your own browser, not inside Discord, which can forget what the page keeps.</li>
     </ul>
     <h2>${app.production ? 'What this page runs on' : 'This test setup'}</h2>
-    <p>${app.production ? 'This page runs on Ting’s production network and Litecoin mainnet, with real coins. It is new: start with small amounts.' : `This page runs only on the Ting development chain and on Litecoin ${esc(app.net)}: no coin here is real.`} It
+    <p>${app.production ? 'This page runs on Ting’s production network and Litecoin mainnet.' : `This page runs only on the Ting development chain and on Litecoin ${esc(app.net)}: no coin here is real.`} It
     reads Ting through <code>${esc(app.node.base)}</code> and Litecoin through <code>${esc(app.ltc.base)}</code>, and
     checks the program’s code before making any call link.</p>
     <dl class="lines facts">

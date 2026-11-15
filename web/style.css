@@ -120,6 +120,7 @@ nav .short { display: none; }
   background: var(--attn-soft); color: var(--attn); border-bottom: 1px solid color-mix(in srgb, var(--attn) 22%, transparent);
   font-size: 12px; line-height: 1.4;
 }
+.test-band[hidden] { display: none; }
 .test-band b { font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 1px 6px; border: 1px solid color-mix(in srgb, var(--attn) 45%, transparent); border-radius: 3px; }
 .test-band .short { display: none; }
 .ltc-page .top { top: 26px; }
