@@ -1060,8 +1060,9 @@ async function resendLtc(t) {
  * again until it is buried. It also sends its Litecoin release or refund
  * again while the explorer does not know it.
  */
-async function autoBuyer(d, t, { ltc = true } = {}) {
+async function autoBuyer(d, t, { ltc = true, ting = true } = {}) {
   if (ltc) await resendLtc(t);
+  if (!ting) return;
   const m = marksOf(t.n);
   const take = takeOfBuyer(d, t);
   if (!take) {
@@ -1175,8 +1176,9 @@ const claimsOf = (t, key) => Object.values(t.ltcClaims ?? {}).filter((s) => (s.k
  * outright it gives up, and claims anew. The listing is done once the accepted
  * lock is spent in a block, whoever spent it.
  */
-async function autoSeller(d, t) {
-  if (d.accepted || d.withdrawn) await releaseOthers(d, t);
+async function autoSeller(d, t, { ting = true } = {}) {
+  // Releases are sent on Ting: not while Ting cannot be read. The claim below needs only the claim already seen.
+  if (ting && (d.accepted || d.withdrawn)) await releaseOthers(d, t);
   if (!d.claimed) return;
   const c = acceptedLock(d, t);
   if (!c) return;
@@ -1218,40 +1220,54 @@ async function autoSeller(d, t) {
   });
 }
 
+/** Whether a seller's trade knows which listing with its key is its own: Ting ID reported the transaction or the account that made it. */
+const pinned = (t) => Boolean(t?.listedTx || t?.maker);
+
 /**
  * What the page reads of Litecoin for one listing, `t` the trade this browser
- * has in it, if any: `first`, the accepted lock's output, the buyer's address
- * and own take, and the page's own transactions; `rest`, every other take's
- * lock, copies of the accepted take included, read a few at a time.
+ * has in it, if any:
+ * - `first`, read every round: the accepted lock's output of the trade on
+ *   screen, of a buyer's listing, or of a seller's own listing, known to be
+ *   its own; the buyer's address and own take; the page's own transactions;
+ * - `followed`: the accepted lock of every other listing with a seller's key,
+ *   a copy, which holds nothing of the seller's, or the seller's own listing
+ *   when the page cannot tell which is its own: a few a round, in turns;
+ * - `rest`: every other take's lock, copies of the accepted take included, a
+ *   few a round.
  */
 function needsOf(d, t) {
   const first = { outs: [], addresses: [], txs: [] };
+  const followed = [];
   const rest = [];
-  if (!d.terms || !forThisPage(d.terms)) return { first, rest };
+  if (!d.terms || !forThisPage(d.terms)) return { first, followed, rest };
+  const seller = t?.role === 'seller' ? t : null;
   const own = t?.role === 'buyer' ? takeOfBuyer(d, t) : null;
-  const accepted = acceptedTake(d, t?.role === 'seller' ? t : d.seller);
+  const accepted = acceptedTake(d, seller ?? d.seller);
+  const sure = !seller || (d.id === seller.listing && pinned(seller)) || d.id === app.viewing;
   for (const take of d.takes) {
     const lock = lockScript(d.terms, take);
     if (!lock) continue;
-    if (take === accepted || take === own) first.outs.push([lock.txid, lock.vout]);
+    if (take === own || (take === accepted && sure)) first.outs.push([lock.txid, lock.vout]);
+    else if (take === accepted) followed.push(lock);
     // After an accept, the other takes matter only to the seller, who releases them.
-    else if (!d.accepted || t?.role === 'seller') rest.push(lock);
+    else if (!d.accepted || seller) rest.push(lock);
   }
   if (t?.role === 'buyer' && t.address) first.addresses.push(t.address);
   for (const s of Object.values(t?.ltcClaims ?? {})) if (s.txid) first.txs.push(s.txid);
   if (t?.releaseTx?.txid) first.txs.push(t.releaseTx.txid);
   for (const r of Object.values(t?.refundTxs ?? {})) if (r.txid) first.txs.push(r.txid);
-  return { first, rest };
+  return { first, followed, rest };
 }
 
 /**
- * Which of the other takes' locks to read this round: at most OTHER_READS,
- * those never read first, then those read longest ago. A lock missing from
- * Litecoin is read again only after MISSING_AGAIN; an output that pays none
- * of the scripts its takes name, or is spent in a block, never again. Takes
- * cost nothing to post: so many cannot keep the explorer from what matters.
+ * Which of these locks to read this round: at most `cap`, those never read
+ * first, then those read longest ago. A lock missing from Litecoin is read
+ * again only after MISSING_AGAIN; an output that pays none of the scripts its
+ * takes name, or is spent in a block, never again. Takes and copied listings
+ * cost little to make: however many there are, they take at most `cap` reads
+ * a round, and each gets its turn.
  */
-function pickRest(locks) {
+function pickRest(locks, cap = OTHER_READS) {
   const byKey = new Map();
   for (const lock of locks) byKey.set(outKey(lock), [...(byKey.get(outKey(lock)) ?? []), lock]);
   const due = [];
@@ -1265,7 +1281,7 @@ function pickRest(locks) {
     else when = o.at ?? 0;
     if (when != null) due.push([when, group[0]]);
   }
-  return due.sort((a, b) => a[0] - b[0]).slice(0, OTHER_READS).map(([, l]) => [l.txid, l.vout]);
+  return due.sort((a, b) => a[0] - b[0]).slice(0, cap).map(([, l]) => [l.txid, l.vout]);
 }
 
 /** Whether a listing of a trade of this browser still has something for the page to do or watch. */
@@ -1273,7 +1289,7 @@ function isActive(d, t) {
   if (!d.terms) return true;
   if (t.role === 'seller') {
     const own = d.id === t.listing;
-    if (t.doneIn?.[d.id] || (own && t.done) || d.refunded) return false;
+    if (t.doneIn?.[d.id] || t.droppedIn?.[d.id] || (own && t.done) || d.refunded) return false;
     return !(d.withdrawn && !d.accepted && (t.releasedIn?.[d.id] || (own && t.releasedAll)));
   }
   return !t.finished;
@@ -1282,9 +1298,11 @@ function isActive(d, t) {
 /**
  * One round of reading and acting: Ting, then Litecoin for every open listing
  * of this browser's trades and the trade on screen, then each one's automatic
- * steps, whatever the view. One listing's failure is that listing's alone. The
- * buyer's claim on Ting, and sending it again, need nothing from Litecoin:
- * they run even when Litecoin cannot be read.
+ * steps, whatever the view. One listing's failure is that listing's alone.
+ * What needs no fresh read of one chain runs while that chain cannot be read:
+ * the buyer's claim on Ting, and sending it again, without Litecoin; the
+ * seller's LTC claim, and sending it again, without Ting, from the claim the
+ * page already saw.
  */
 async function round() {
   await refreshTing();
@@ -1293,10 +1311,12 @@ async function round() {
     for (const id of listingsOf(t)) if (isActive(tradeOf(id), t)) jobs.push({ t, id });
   }
   const firsts = [];
+  const followed = [];
   const rests = [];
   const add = (d, t) => {
     const n = needsOf(d, t);
     firsts.push(n.first);
+    followed.push(...n.followed);
     rests.push(...n.rest);
   };
   for (const { t, id } of jobs) {
@@ -1314,6 +1334,9 @@ async function round() {
   }
   const outs = new Map();
   for (const f of firsts) for (const [txidHex, vout] of f.outs) outs.set(`${txidHex}:${vout}`, [txidHex, vout]);
+  // The followed listings' accepted locks take their turns ahead of other takes, so that a seller's own
+  // listing among copies is read within a few rounds however many copies there are.
+  for (const [txidHex, vout] of pickRest(followed.filter((l) => !outs.has(outKey(l))))) outs.set(`${txidHex}:${vout}`, [txidHex, vout]);
   const first = {
     outs: [...outs.values()],
     addresses: [...new Set(firsts.flatMap((f) => f.addresses))],
@@ -1321,15 +1344,16 @@ async function round() {
   };
   await refreshLtc(first, { outs: pickRest(rests).filter(([txidHex, vout]) => !outs.has(`${txidHex}:${vout}`)) });
   app.readEvery = jobs.length || app.viewing != null ? TRADE_POLL : MARKET_POLL;
-  if (!K.seed() || app.tingError) return;
+  if (!K.seed()) return;
+  const tingRead = !app.tingError;
   const ltcRead = !app.lt.error;
   for (const job of jobs) {
     const fresh = () => myTrades().find((x) => x.n === job.t.n) ?? job.t;
     try {
       const t = fresh();
-      if (t.role === 'buyer') await autoBuyer(tradeOf(job.id), t, { ltc: ltcRead });
-      else if (ltcRead) await autoSeller(tradeOf(job.id), t);
-      if (ltcRead) noteFinished(tradeOf(job.id), fresh());
+      if (t.role === 'buyer') await autoBuyer(tradeOf(job.id), t, { ltc: ltcRead, ting: tingRead });
+      else if (ltcRead) await autoSeller(tradeOf(job.id), t, { ting: tingRead });
+      if (ltcRead && tingRead) noteFinished(tradeOf(job.id), fresh());
       app.actionErrors.delete(job.id);
     } catch (e) {
       app.actionErrors.set(job.id, e.message);
@@ -1339,12 +1363,20 @@ async function round() {
 
 /**
  * Marks what is over: a seller's withdrawn listing whose other locks are all
- * released, spent or not there; a buyer whose part is over (the DLR claimed
- * and buried, or the LTC back) with nothing left at the lock address.
+ * released, spent or not there; a listing whose accepted lock Litecoin still
+ * has not seen when its T1 has passed, which nothing can claim any more (a
+ * copy whose maker accepted a lock that does not exist, say); a buyer whose
+ * part is over (the DLR claimed and buried, or the LTC back) with nothing left
+ * at the lock address.
  */
 function noteFinished(d, t) {
   if (!d.terms) return;
   if (t.role === 'seller') {
+    if (d.accepted && !t.droppedIn?.[d.id] && app.lt.tip && app.lt.tip.mtp > d.accepted.t1) {
+      const take = acceptedTake(d, t);
+      const o = take && outOf(take.lockOf.txid, take.lockOf.vout);
+      if (!take || o?.missing) update(t, { droppedIn: { ...(t.droppedIn ?? {}), [d.id]: true } });
+    }
     if (!d.withdrawn || d.accepted || t.releasedIn?.[d.id]) return;
     const open = d.takes.some((x) => {
       const c = checkTake(d.terms, x);
@@ -1729,7 +1761,7 @@ async function freshCounter() {
 
 function renderTrade(main, id) {
   main.className = 'detail trade';
-  const form = { receive: '', refund: '', payout: '', holds: null };
+  const form = { receive: '', refund: '', payout: '', maker: '', holds: null };
   const draw = () => {
     const active = document.activeElement;
     if (active && main.contains(active) && active.matches('input, textarea')) return;
@@ -1784,7 +1816,8 @@ function tradeHtml(id, form) {
         <header><div><div class="eyebrow">Listing #${l.id} · ${roleChip}</div><h1>${dlr(l.amount)}</h1><p class="muted">for ${ltc(l.want)}${usd(l.want)}</p></div>${status}</header>
         <p class="hint terms-line">${rateText(l.amount, l.want)} · held ${span(l.window)} once accepted${H.isZero(l.taker) ? '' : ` · only for ${who(l.taker)}`}</p>
         ${role === 'watcher' ? endedBanner(d) : ''}
-        ${role === 'watcher' && copiedBy(id) ? `<div class="callout">${icon('key')}<div><b>This listing names your Litecoin key</b>, from your listing <a href="#/l/${int(copiedBy(id).listing)}">#${int(copiedBy(id).listing)}</a>, but another account made it. Only its maker can accept a lock for it; if one is accepted and claimed, the LTC is paid to your key, and your page claims it for you, as it releases this listing’s other locks.</div></div>` : ''}
+        ${role === 'watcher' && copiedBy(id) ? copyNote(copiedBy(id), form) : ''}
+        ${role === 'seller' && !pinned(d.seller) && (d.seller.listings?.length ?? 0) > 1 ? whichIsYours(d.seller, form) : ''}
         ${panelsHtml}
         ${usdNote() ? `<p class="hint usd-note">${usdNote()}</p>` : ''}
       </section>
@@ -1795,6 +1828,25 @@ function tradeHtml(id, form) {
         ${panelsHtml.includes('data-share') ? '' : shareCard(d)}
       </aside>
     </div>`;
+}
+
+/** On a listing that names a seller trade's key without being its own. */
+function copyNote(t, form) {
+  const main = `<a href="#/l/${int(t.listing)}">#${int(t.listing)}</a>`;
+  return `<div class="callout">${icon('key')}<div><b>This listing names your Litecoin key</b>, as your listing ${main} does, ${pinned(t) ? 'but another account made it' : 'and the page cannot tell which of them you made'}.
+    Only its maker can accept a lock for it; if one is accepted and claimed, the LTC is paid to your key, and your page claims it for you, as it releases this listing’s other locks.${pinned(t) ? '' : ` If this one is yours, enter the Ting account you listed with on ${main}.`}</div></div>
+    ${payoutField(t, form)}`;
+}
+
+/**
+ * Asks the seller of a trade whose key several listings name, and whose own
+ * listing the page cannot tell (after a restore without the account), for the
+ * account they listed with.
+ */
+function whichIsYours(t, form) {
+  const others = t.listings.filter((x) => x !== t.listing).map((x) => `<a href="#/l/${int(x)}">#${int(x)}</a>`).join(', ');
+  return `<div class="callout warn">${icon('key')}<div><b>Other listings name this trade’s Litecoin key:</b> ${others}. Anyone can list again with a key, and this page cannot tell which listing you made: it shows the first, and acts for all of them. Enter the Ting account you listed with, and it picks yours.
+    <div class="row inline-form"><input class="mono" name="maker" placeholder="64 hex digits, from Ting ID → Receive → Spending" value="${esc(form.maker ?? '')}" spellcheck="false"><button data-pin-maker>Pick mine</button></div></div></div>`;
 }
 
 function endedBanner(d) {
@@ -1951,7 +2003,7 @@ function sellerClaimedPanel(d, t, form) {
   if (!main) {
     const take = acceptedTake(d, t);
     const o = take && outOf(take.lockOf.txid, take.lockOf.vout);
-    if (o?.missing) return panel('The accepted lock is not on Litecoin', `<p>The explorer has no output ${txid(take.lockOf.txid)}:${int(take.lockOf.vout)}. The page cannot claim it.</p>`, 'bad');
+    if (o?.missing) return panel('The accepted lock is not on Litecoin', `<p>The explorer has no output ${txid(take.lockOf.txid)}:${int(take.lockOf.vout)}. The page cannot claim it.</p>${(t.listings?.length ?? 0) > 1 ? payoutField(t, form) : ''}`, 'bad');
     return panel('The buyer claimed: reading the lock', `${waiting('Reading the accepted lock on Litecoin…')}`, 'act');
   }
   if (main.out.spent && !byUs(main.out.spender)) {
@@ -2291,7 +2343,7 @@ function shareCard(d) {
 
 function wireTrade(main, id, form, draw) {
   wireCommon(main);
-  for (const name of ['receive', 'refund', 'payout']) {
+  for (const name of ['receive', 'refund', 'payout', 'maker']) {
     $$(`[name=${name}]`, main).forEach((input) => (input.oninput = (e) => {
       form[name] = e.target.value;
       if (name === 'receive') receiveHint(main, form);
@@ -2308,6 +2360,7 @@ function wireTrade(main, id, form, draw) {
   on('[data-take-back]', () => takeBack(id, form));
   on('[data-refund-ltc]', () => refundLtc(id, form));
   on('[data-save-payout]', () => savePayout(id, form));
+  on('[data-pin-maker]', () => pinMaker(id, form));
   on('[data-forget]', () => forget(id));
   draw.wired = true;
 }
@@ -2402,6 +2455,13 @@ function linkHolds(d, t, key) {
   return Boolean(d.open) || !closing || depthOf(closing.height) < app.tconfs;
 }
 
+/** Only a listing's maker can accept or withdraw it: once one of this browser's calls did, the listing is the trade's own. */
+function pinFromCall(t, id, executed) {
+  if (!t || pinned(t) || !executed?.account) return;
+  const listed = tradeOf(id).listed;
+  if (listed && equal(listed.maker, executed.account)) update(t, { maker: hex(executed.account), listedTx: listed.tx });
+}
+
 /** Whether this browser released, or sent a release of, the lock a take names. */
 function releasedHere(d, take) {
   return Boolean(take.lockOf && d.seller?.releases?.[outKey(take.lockOf)]) || Boolean(releaseOf(d, take));
@@ -2433,7 +2493,7 @@ async function accept(id, index) {
   await perform({
     call: H.acceptCall(listing, take), feeCoin: app.coin, label: `Accept the lock for listing #${id}`,
     notes: `<p class="hint">Checked on Litecoin just now: ${esc(c.words)}. Ting ID shows the buyer’s account and the hash shortened, and the time their lock ends.</p>`,
-    done: () => { app.onData?.(); },
+    done: (ok, executed) => { if (ok) pinFromCall(d.seller, id, executed); app.onData?.(); },
   });
 }
 
@@ -2508,7 +2568,7 @@ async function withdraw(id) {
   await perform({
     call: H.withdrawCall(listing), from: listing.maker, feeCoin: app.coin, label: `Withdraw listing #${id}`,
     notes: d.takes.length ? '<p class="hint">Once it is withdrawn, your page releases the buyers’ locks by itself, so they take their LTC back at once.</p>' : '',
-    done: () => app.onData?.(),
+    done: (ok, executed) => { if (ok) pinFromCall(d.seller, id, executed); app.onData?.(); },
   });
 }
 
@@ -2585,11 +2645,28 @@ async function refundLtc(id, form) {
   await read();
 }
 
+/** The seller names the account they listed with: the trade's own listing is the one that account made. */
+async function pinMaker(id, form) {
+  const t = tradeOf(id).seller;
+  const account = accountOf(form.maker);
+  if (!t) return;
+  if (!account) throw new Error('A Ting account is 64 hex digits, or the ting:pay link Ting ID shows under Receive.');
+  const made = (t.listings ?? []).map((x) => tradeOf(x).listed).find((e) => e && equal(e.maker, account));
+  if (!made) throw new Error('None of the listings with this trade’s key was made by that account.');
+  update(t, { maker: hex(account) });
+  findMyListings();
+  toast(`Your listing is #${int(made.id)}.`, 'success', 5000);
+  if (made.id !== id) location.hash = `#/l/${made.id}`;
+  else app.onData?.();
+}
+
 async function savePayout(id, form) {
-  const d = tradeOf(id);
+  // A restored trade's payout address, entered on its listing or on another with its key: the trade claims for all of them.
+  const t = tradeOf(id).seller ?? copiedBy(id);
+  if (!t) return;
   const problem = addressProblem(form.payout) ?? (form.payout.trim() ? null : 'Enter your Litecoin address.');
   if (problem) throw new Error(problem);
-  update(d.seller, { payout: form.payout.trim() });
+  update(t, { payout: form.payout.trim() });
   app.onData?.();
 }
 
@@ -2659,7 +2736,7 @@ function renderAbout(main) {
 
 function renderBackup(main) {
   main.className = 'about backup';
-  const state = { shown: false, restoring: false, found: null, error: null, code: '', replace: false };
+  const state = { shown: false, restoring: false, found: null, error: null, code: '', account: '', replace: false };
   const draw = () => {
     const s = K.seed();
     const trades = myTrades();
@@ -2684,6 +2761,8 @@ function renderBackup(main) {
       and locks made with its secrets, and puts those trades back. Use one code in one browser at a time.</p>
       <form class="card restore" id="restore-form" autocomplete="off">
         <label class="field"><span>Backup code</span><textarea name="code" rows="2" class="mono" spellcheck="false" placeholder="tingswap1…">${esc(state.code)}</textarea></label>
+        <label class="field"><span>The Ting account you listed with <span class="muted">(optional, for a seller)</span></span><input name="account" class="mono" spellcheck="false" placeholder="64 hex digits, from Ting ID → Receive → Spending" value="${esc(state.account)}">
+          <span class="hint">Anyone can list again with your listing’s Litecoin key. With your account, the page tells your listing from such copies; without it, it takes the first.</span></label>
         ${s ? `<label class="toggle"><input type="checkbox" name="replace"${state.replace ? ' checked' : ''}> <span>Replace this browser’s own code. I wrote it down.</span></label>` : ''}
         <div class="row"><button class="primary" type="submit"${state.restoring ? ' disabled' : ''}>${state.restoring ? '<span class="spinner"></span> Reading the events…' : 'Restore'}</button></div>
         ${state.error ? `<p class="hint error">${esc(state.error)}</p>` : ''}
@@ -2695,6 +2774,7 @@ function renderBackup(main) {
     $('[data-hide]', main)?.addEventListener('click', () => { state.shown = false; draw(); });
     $('[data-saved]', main)?.addEventListener('click', () => { K.markBackedUp(); draw(); });
     $('[name=code]', main).oninput = (e) => { state.code = e.target.value; };
+    $('[name=account]', main).oninput = (e) => { state.account = e.target.value; };
     const replace = $('[name=replace]', main);
     if (replace) replace.onchange = (e) => { state.replace = e.target.checked; };
     $('#restore-form', main).onsubmit = async (e) => {
@@ -2716,7 +2796,9 @@ function renderBackup(main) {
       state.restoring = true;
       draw();
       try {
-        state.found = await restore(seedBytes);
+        const account = state.account.trim() ? accountOf(state.account) : null;
+        if (state.account.trim() && !account) throw new Error('The Ting account is 64 hex digits, or the ting:pay link Ting ID shows under Receive.');
+        state.found = await restore(seedBytes, account);
         state.code = '';
       } catch (err) {
         state.error = err.message;
@@ -2736,12 +2818,14 @@ function renderBackup(main) {
  * Keys and hashes are public once on chain, and anyone can list again with a
  * key, even ahead of the real listing, or post a take again with a hash. A
  * seller trade follows every listing with its key (acting on a copy is
- * harmless), and shows the first. Of the takes with the hash and this seed's
+ * harmless), and shows the one made by `account`, the Ting account the user
+ * listed with, when given; else the first, which a copy put ahead of the real
+ * listing could be: the page cannot tell, and says so. Of the takes with the hash and this seed's
  * key, the trade's is the earliest whose rebuilt lock address Litecoin has
  * seen paid; a copy with another account, T1 or listing points at an address
  * nobody paid.
  */
-async function restore(seedBytes) {
+async function restore(seedBytes, account = null) {
   if (!K.canStore()) throw new Error('This browser does not let the page keep keys.');
   await refreshTing();
   if (app.tingError) throw new Error(`Cannot read Ting: ${app.tingError}`);
@@ -2755,11 +2839,14 @@ async function restore(seedBytes) {
     const m = K.marksAt(seedBytes, n);
     if (!m) continue;
     const owns = listed.filter((e) => equal(e.key, m.pub));
-    const own = owns[0];
+    // The account the user listed with, when given, tells their listing from copies; without it, the first.
+    const byAccount = account ? owns.find((e) => equal(e.maker, account)) : null;
+    const own = byAccount ?? owns[0];
     if (own) {
       found.push({
         n, role: 'seller', listing: own.id, listings: owns.map((e) => e.id), created: own.time * 1000, payout: null,
         amount: String(own.amount), want: String(own.want), window: own.window, fee: String(own.fee), restored: true,
+        ...(byAccount ? { maker: hex(account) } : {}),
       });
     }
     const takes = taken.filter((e) => equal(e.hash, m.hash));

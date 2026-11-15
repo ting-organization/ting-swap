@@ -323,12 +323,18 @@ computer.
   by counter from 0, looks for listed events whose `key` is key n's public key (seller
   trades) and taken events whose hash is `SHA-256(secret n)` (buyer trades), until 20
   counters in a row find nothing. Keys and hashes are public once on chain, and anyone
-  can list again with a key or post a take again with a hash: a seller trade follows
-  every listing with the key and shows the first; the buyer trade is the earliest take
-  with the hash and this seed's key whose rebuilt lock address the explorer has seen paid
-  (the earliest, marked unchecked, when the explorer cannot say). What the chain does not hold comes back blank: a seller's payout address
-  (the trade asks for it before claiming), and a lock that was paid but whose take never
-  reached Ting. Another browser's code replaces this one's and its trades only when the
+  can list again with a key or post a take again with a hash. A seller trade follows
+  every listing with the key. Which of them the seller made, the chain alone cannot tell
+  a restore: a copy can even come first, if its maker saw the offer in Ting's pool and
+  got into an earlier block. So the restore asks, optionally, for the Ting account the
+  seller listed with, and takes the listing that account made; without it, the first,
+  and the trade's page says that it cannot tell, and asks for the account there. The
+  buyer trade is the earliest take with the hash and this seed's key whose rebuilt lock
+  address the explorer has seen paid (the earliest, marked unchecked, when the explorer
+  cannot say). What the chain does not hold comes back blank: a seller's payout address
+  (the trade asks for it before claiming, on its listing and on every other with its key,
+  since it claims for all of them), and a lock that was paid but whose take never reached
+  Ting. Another browser's code replaces this one's and its trades only when the
   user says they wrote this one down.
 - **Selling.** The seller gives the DLR amount, the LTC wanted, a payout address (checked
   for the network), and under *More options* the window (6 to 168 h, default 12) and
@@ -340,8 +346,14 @@ computer.
   copy is harmless: only its maker can accept it, and a claim of any of its locks pays the
   seller's key. So a seller trade follows every listing with its key, and its automatic
   steps (releasing locks, claiming the LTC) run for each of them. The trade's own listing,
-  the one it shows, is the one made by the transaction Ting ID reported, else by the
-  account it reported, else the first; a copy's page says whose key it names.
+  the one it shows, is the one made by the transaction Ting ID reported, or by the
+  account it reported, or by the account that made a successful accept or withdrawal from
+  this browser (only a listing's maker can), or by the account the seller entered; else
+  the first, and the page says it cannot tell. A copy holds nothing of the seller's, and
+  copies cost their makers little: the page reads a copy's accepted lock only in turns,
+  a few a round (see *Reading*), and stops following a listing whose accepted lock
+  Litecoin still has not seen once its T1 has passed, since nothing can claim it then.
+  A copy's page says whose key it names.
 - **Locking.** The buyer gives the Ting account that receives the DLR and, optionally, a
   refund address. The page refuses a listing whose window is under 6 hours (see the
   claims above: too little room for a first claim). It takes a counter, sets
@@ -396,8 +408,9 @@ computer.
   gives up one Litecoin refuses outright and claims anew, and warns when a claim has
   waited more than 30 minutes for a block: it cannot be sped up (it does not signal
   replace-by-fee, and has no output of the seller's to pay more from), and it must be in
-  a block before T1. (`ltc.js` can sweep several locks in one claim, `claimAllTx`; the
-  page does not.)
+  a block before T1. The claim, and sending it again, need only the claimed event the
+  page already read and Litecoin: they go out while the page's Ting node cannot be
+  reached.
 - **The way back.** After the deadline anyone may send the refund on Ting; the page offers
   it. A buyer whose lock the seller released takes it back at once. After T1, by
   Litecoin's median time past, the buyer's page refunds every output in a block at the lock
@@ -411,17 +424,23 @@ computer.
 - **Reading.** Every 4 seconds while a trade of this browser is open, or a trade is on
   screen, whatever the view, the page reads Ting, then Litecoin, then runs each open
   listing's automatic steps; one listing's failure is that listing's alone. Each Litecoin
-  read is on its own: one that fails stops no other. The page reads first only the
-  accepted lock's output, the buyer's own take and address, and its own transactions;
-  every other take's output, copies of the accepted take included, since takes cost
-  nothing to post, at most 8 a round, those never read first, an output Litecoin did not
-  have again only after 5 minutes, and one that pays another script, or is spent in a
-  block, never again. The buyer's claim on Ting, and sending it again, need nothing from
-  Litecoin: they run even while Litecoin cannot be read, since a claim sent has made the
-  secret public. The page keeps every trade's state in the browser so that a reload
-  loses nothing, shows a node's or an explorer's error with a retry, and acts on nothing
-  it could not read. Numbers and ids from the node or the explorer are checked before
-  they reach the page.
+  read is on its own: one that fails stops no other. Every round it reads the accepted
+  lock's output of the seller's own listing, known to be its own, of a buyer's listing
+  and of the trade on screen, the buyer's own take and address, and its own
+  transactions. Then, in turns, at most 8 a round: the accepted locks of the other
+  listings with a seller's key (copies, or the seller's own when the page cannot tell),
+  ahead of every other take's output, copies of the accepted take included, at most 8
+  more. Takes cost nothing to post and copies little, so however many there are, they
+  cost at most those reads a round, and each, the seller's own listing among them, gets
+  its turn within a few rounds: those never read go first, then those read longest ago. An
+  output Litecoin did not have is read again only after 5 minutes, and one that pays
+  another script, or is spent in a block, never again. What needs no fresh read of one
+  chain runs while that chain cannot be read: the buyer's claim on Ting, and sending it
+  again, without Litecoin, since a claim sent has made the secret public; the seller's
+  LTC claim, and sending it again, without Ting. The page keeps every trade's state in
+  the browser so that a reload loses nothing, shows a node's or an explorer's error with
+  a retry, and acts on nothing it could not read. Numbers and ids from the node or the
+  explorer are checked before they reach the page.
 - **Explorer.** The page reads Litecoin from an Esplora-style API: litecoinspace.org, or
   `scripts/ltc-dev.mjs` on a regtest chain.
 

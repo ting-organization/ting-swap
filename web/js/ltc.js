@@ -786,35 +786,13 @@ const finishAll = ({ tx, kept, skipped, fee, total }) => ({
 });
 
 /**
- * The seller's claim of several locks with one secret, in one transaction:
- * each input as `claimTx` spends one, `sig(seller) ‖ secret ‖ 01 ‖ script`,
- * SIGHASH_ALL, nLockTime 0 and final nSequences. Takes `{ inputs, secret,
- * key, to, feeRate, network }`, each input `{ txid, vout, value, htlc }` with
- * the secret's hash and the seller's key; gives `{ hex, txid, fee, vsize, tx,
- * value, spent, skipped }`. With one input it is `claimTx`'s transaction.
- * The page does not sweep: its seller claims the accepted lock alone, since
- * whatever else is at the lock address is the buyer's (HTLC.md, the page).
- */
-export function claimAllTx({ inputs, secret, key, ...options }) {
-  checkBytes(secret, 32, 'the secret');
-  for (const lock of inputs ?? []) {
-    htlcScript(lock.htlc);
-    checkSigner(key, lock.htlc.seller, 'seller');
-    if (!equal(sha256(secret), lock.htlc.hash)) throw new Error("the secret does not hash to a lock's hash");
-  }
-  const spent = spendAll(inputs, options, { sequence: FINAL, locktime: 0, stack: (sig) => [sig, secret, Uint8Array.of(1)] });
-  spent.kept.forEach((k, i) => {
-    spent.tx.inputs[i].witness[0] = signed(key, sighash(spent.tx, i, k.script, k.amount, SIGHASH_ALL), SIGHASH_ALL);
-  });
-  return finishAll(spent);
-}
-
-/**
  * The buyer's refund of several locks after their T1s, in one transaction:
  * each input as `refundTx` spends one, `sig(buyer) ‖ 01 ‖ (empty) ‖ script`,
  * SIGHASH_ALL, nSequence 0xfffffffe, and nLockTime the latest T1. Takes
  * `{ inputs, key, to, feeRate, network }`, each input `{ txid, vout, value,
- * htlc }` with the buyer's key; gives what `claimAllTx` gives.
+ * htlc }` with the buyer's key; gives `{ hex, txid, fee, vsize, tx, value,
+ * spent, skipped }`, `spent` the outputs it spends and `skipped` those left
+ * out. With one input it is `refundTx`'s transaction.
  */
 export function refundAllTx({ inputs, key, ...options }) {
   let locktime = 0;
