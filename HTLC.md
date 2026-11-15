@@ -444,17 +444,21 @@ computer.
 - **Explorer.** The page reads Litecoin from an Esplora-style API: litecoinspace.org, or
   `scripts/ltc-dev.mjs` on a regtest chain.
 
-## Before production
+## Production
 
-The page is a test setup. Before it handles real coins:
+The program runs on the production network as
+`bc0d789dc5b7338bd19d1e7d3723ed09b09885634063bba4389f7f2b2765447d` (CodeHash
+`69012957b35f411457652e9c44004ada21396c3b038c2d86f32bfde339c331c7`), deployed with
+`node scripts/htlc-deploy.mjs --submit`. Opened without a test setup's address, the page
+runs on it exactly as `LTC_PRODUCTION` in `web/js/config.js` pins it: node1, the
+program, Daler, Litecoin mainnet through litecoinspace.org, Ting ID Web, 3 Litecoin
+confirmations before accepting and 30 Ting blocks under an accept before claiming. No
+link can change any of them, and its links carry no query string. A test setup's
+address, which names a `node`, keeps the development chain and Litecoin regtest or
+testnet, and refuses mainnet.
 
-- **Pin the configuration.** The link chooses the node, the program, the coin, the
-  explorer and the confirmations today, and a shared link carries them along: a scammer's
-  link could name their own coin called DLR, or their own explorer, which makes a seller's
-  page accept a lock that does not exist. Pin the node, program, coin and explorer per
-  network in `config.js`, and ignore overrides there, or make them very loud.
-- **Share links without the query string.** On production, a trade link, and a call
-  link's `return`, should be the page's own address and the trade, not `location.search`.
+What is left before it is published:
+
 - **Serve it from its own domain.** The seed sits in the browser's storage, and every
   project page under `ting-organization.github.io` shares one origin: any of them, or an
   XSS in any, could read it. Serve the page from a domain of its own, as Ting ID Web is,

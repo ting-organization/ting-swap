@@ -6,10 +6,11 @@
 // and refunds on Ting, which need no signature, and the Litecoin claim,
 // release and refund, which it signs here.
 //
-// A test setup only: it refuses to run on anything but the Ting development
-// chain and Litecoin regtest or testnet.
+// On the production network as config.js pins it (LTC_PRODUCTION), or, opened
+// with a test setup's address, on the Ting development chain and Litecoin
+// regtest or testnet.
 import { equal, hex, Reader, unhex } from './bytes.js';
-import { CODE_HASHES } from './config.js';
+import { CODE_HASHES, LTC_PRODUCTION } from './config.js';
 import * as H from './htlc.js';
 import * as K from './ltc-keys.js';
 import * as L from './ltc.js';
@@ -48,7 +49,7 @@ function safeUrl(text) {
 /** The only Ting chain this page runs on: the development chain. */
 const DEVELOPMENT = '8578787146be1ef0aacc797754001290272915e89cd9e5784fe1368e4c2131bc';
 /** htlc.wasm's CodeHash, as build.sh prints it. */
-const HTLC_CODE = '69012957b35f411457652e9c44004ada21396c3b038c2d86f32bfde339c331c7';
+const HTLC_CODE = CODE_HASHES.htlc;
 /** The Litecoin networks this page runs on. Never mainnet. */
 const LTC_NETS = ['regtest', 'testnet'];
 /** T1 is the listing's window, the program's gap and this much more after the lock is made: time for the seller to accept. */
@@ -721,6 +722,16 @@ function checkTake(terms, take) {
   const counted = `${ltcText(out.value)} LTC locked, ${depth} of ${app.confs} confirmation${app.confs === 1 ? '' : 's'}`;
   if (depth < app.confs) return { state: 'wait', words: `${counted}: waiting for confirmations`, lock, out, depth };
   return { state: 'ok', words: `${counted}: ready`, lock, out, depth };
+}
+
+/** What a Litecoin address starts with on this page's network, for a field's placeholder. */
+const addressHint = () => ({ mainnet: 'ltc1…', regtest: 'rltc1…' })[app.net] ?? 'tltc1…';
+
+/** The band and the footer say what the page runs on: real coins in production, or a test setup. */
+function markSetup() {
+  if (app.production) return;
+  $('.test-band').innerHTML = `<b>Test setup</b><span class="long">The Ting development chain and Litecoin ${esc(app.net)}. No coin here is real.</span><span class="short">No coin here is real.</span>`;
+  $('.foot span').textContent = `Ting Swap · DLR ↔ LTC · a test setup on the Ting development chain and Litecoin ${app.net} · your keys stay in this browser`;
 }
 
 // ---- LTC's price in USD ------------------------------------------------------
@@ -1623,7 +1634,7 @@ function renderSell(main) {
             <div class="amount-row"><input id="sell-want" name="want" inputmode="decimal" placeholder="0.0" value="${esc(form.want)}"><span id="want-usd"></span><span class="unit-tag">${ltcMark} LTC</span></div>
           </div>
           <label class="field wide-field"><span>Your Litecoin address, to be paid</span>
-            <input id="sell-payout" name="payout" class="mono" placeholder="${app.net === 'regtest' ? 'rltc1…' : 'tltc1…'}" value="${esc(form.payout)}" spellcheck="false">
+            <input id="sell-payout" name="payout" class="mono" placeholder="${addressHint()}" value="${esc(form.payout)}" spellcheck="false">
             <span class="hint" id="payout-hint">Your page claims the LTC to this address by itself.</span></label>
           <details class="owner"${form.taker || form.hours !== '12' ? ' open' : ''}><summary>More options</summary>
             <label class="field"><span>Lock window, hours</span><input id="sell-hours" name="hours" type="number" min="${H.MIN_WINDOW / 3600}" max="${H.MAX_WINDOW / 3600}" step="1" value="${esc(form.hours)}">
@@ -1679,7 +1690,7 @@ function renderSell(main) {
     }
     const call = H.offerCall({ taker: v.taker, chain: 'LTC', want: v.want, key: publicKey(new Uint8Array(32).fill(1)), window: v.hours * 3600, coin: app.coin, fee: v.fee ?? 0n });
     box.innerHTML = `<div class="preview-line"><span class="label">Rate</span><b>${rateText(v.amount, v.want)}</b></div>
-      <div class="preview-line"><span class="label">Network fee</span><span>${dlr(v.fee)} <span class="muted">${app.claimRate ? `· ${FEE_MARGIN}× what a claim pays now, paid by the buyer’s claim` : '· the least, as nothing paid fees lately'}</span></span></div>
+      <div class="preview-line"><span class="label">Network fee</span><span>${dlr(v.fee)} <span class="muted">${!app.claimRate ? '· the least, as nothing paid fees lately' : twoDigits(FEE_MARGIN * app.claimRate) >= v.fee ? `· ${FEE_MARGIN}× what a claim pays now, paid by the buyer’s claim` : `· the least the page sets: a claim pays about ${dlrText(app.claimRate)} ${esc(app.dlr.symbol)} now`}</span></span></div>
       ${v.problems.length ? `<p class="hint error">${esc(v.problems.join(' '))}</p>` : ''}
       <details class="owner tech"><summary>What Ting ID will show</summary><p class="wallet-preview">${walletSentence(call.template, call.values, { amount: v.amount }, { key: '<b class="placeholder">33 bytes</b>' })}</p></details>`;
   };
@@ -1985,7 +1996,7 @@ function takeRows(d, { seller = false, skipAccepted = false } = {}) {
 function payoutField(t, form) {
   if (t.payout) return '';
   return `<div class="callout warn">${icon('alert')}<div><b>Where should your LTC go?</b> This trade was restored from a backup code, which does not hold your payout address.
-    <div class="row inline-form"><input class="mono" name="payout" placeholder="${app.net === 'regtest' ? 'rltc1…' : 'tltc1…'}" value="${esc(form.payout)}" spellcheck="false"><button data-save-payout>Save</button></div></div></div>`;
+    <div class="row inline-form"><input class="mono" name="payout" placeholder="${addressHint()}" value="${esc(form.payout)}" spellcheck="false"><button data-save-payout>Save</button></div></div></div>`;
 }
 
 function sellerClaimedPanel(d, t, form) {
@@ -2030,7 +2041,7 @@ function sellerClaimedPanel(d, t, form) {
     ${t.ltcClaimError ? `<div class="callout bad">${icon('alert')}<div><b>Litecoin refused the claim:</b> ${esc(t.ltcClaimError)}. The page tries again.</div></div>` : ''}
     ${slow ? `<div class="callout warn">${icon('clock')}<div><b>Your LTC claim has waited ${span(now() - (slow.first ?? slow.at))} for a Litecoin block.</b> It pays ${int(slow.rate) || 'the'} litoshi per vbyte; if Litecoin’s fees rose since, it can wait a long time. This page cannot speed it up: the claim does not signal replace-by-fee, and has no output of yours to pay more from. It must be in a block before the buyer’s lock ends, ${when(d.accepted.t1)}: after that, the buyer could refund the LTC instead.</div></div>` : ''}
     <dl class="lines mini-lines">${lines}</dl>
-    ${waiting(claims.length ? 'Waiting for a Litecoin block: about 2.5 minutes on Litecoin; here, whenever the regtest chain mines.' : 'Building and sending the claim…')}`, 'act');
+    ${waiting(claims.length ? (app.net === 'regtest' ? 'Waiting for a Litecoin block: here, whenever the regtest chain mines.' : 'Waiting for a Litecoin block: about 2.5 minutes.') : 'Building and sending the claim…')}`, 'act');
 }
 
 // ---- The buyer's side ------------------------------------------------------
@@ -2057,7 +2068,7 @@ function offerPanel(d, form) {
       <span class="hint" id="receive-hint">In Ting ID: Wallet → Receive → Spending. A ting:pay link works too.</span></label>
     <details class="owner"${form.refund ? ' open' : ''}><summary>Refund address (optional)</summary>
     <label class="field wide-field"><span>Your Litecoin address for refunds</span>
-      <input name="refund" class="mono" placeholder="${app.net === 'regtest' ? 'rltc1…' : 'tltc1…'}" value="${esc(form.refund)}" spellcheck="false">
+      <input name="refund" class="mono" placeholder="${addressHint()}" value="${esc(form.refund)}" spellcheck="false">
       <span class="hint" id="refund-hint">Only needed if the trade does not go through. You can add it later.</span></label></details>
     <div class="row"><button class="primary large" data-make-lock>${icon('lock')} Make my Litecoin lock</button></div>
     ${nextLine('Nothing is sent yet: next you get an address to pay from your own Litecoin wallet.')}`, 'act');
@@ -2217,7 +2228,7 @@ function releasedPanel(d, t, take, released, form) {
 
 function addressField(t, form) {
   return `<label class="field wide-field"><span>Your Litecoin address</span>
-    <input name="refund" class="mono" placeholder="${app.net === 'regtest' ? 'rltc1…' : 'tltc1…'}" value="${esc(form.refund || t.refundTo || '')}" spellcheck="false">
+    <input name="refund" class="mono" placeholder="${addressHint()}" value="${esc(form.refund || t.refundTo || '')}" spellcheck="false">
     <span class="hint">Where your LTC goes back to.</span></label>`;
 }
 
@@ -2719,8 +2730,8 @@ function renderAbout(main) {
       <li><b>Nobody needs to send first.</b> If someone asks you to send coins outside these steps, it is not this swap.</li>
       <li>Open links in your own browser, not inside Discord, which can forget what the page keeps.</li>
     </ul>
-    <h2>This test setup</h2>
-    <p>This page runs only on the Ting development chain and on Litecoin ${esc(app.net)}: no coin here is real. It
+    <h2>${app.production ? 'What this page runs on' : 'This test setup'}</h2>
+    <p>${app.production ? 'This page runs on Ting’s production network and Litecoin mainnet, with real coins. It is new: start with small amounts.' : `This page runs only on the Ting development chain and on Litecoin ${esc(app.net)}: no coin here is real.`} It
     reads Ting through <code>${esc(app.node.base)}</code> and Litecoin through <code>${esc(app.ltc.base)}</code>, and
     checks the program’s code before making any call link.</p>
     <dl class="lines facts">
@@ -2965,45 +2976,66 @@ async function boot() {
   $('#theme').innerHTML = icon('contrast');
   $('#theme').onclick = toggleTheme;
   const query = new URLSearchParams(location.search);
-  const nodeBase = query.get('node');
-  app.net = query.get('ltcnet') ?? '';
-  if (!nodeBase || !query.get('htlc') || !query.get('ltc')) {
-    return fatal('This page needs its test setup', 'Open it with the address <code>node scripts/htlc-dev.mjs url</code> prints: it names the Ting node, the HTLC program, the DLR coin, Ting ID Web and the Litecoin explorer.');
+  // Opened with a test setup's address (scripts/htlc-dev.mjs url): the
+  // development chain and Litecoin regtest or testnet, as the address names
+  // them. Otherwise production, exactly as config.js pins it: no link can
+  // change its node, program, coin, explorer, wallet or depths.
+  app.production = !query.has('node');
+  const setup = app.production ? LTC_PRODUCTION : {
+    chainId: DEVELOPMENT, node: query.get('node'), htlc: query.get('htlc'), coin: (query.get('coins') ?? '').split(',')[0],
+    ltc: query.get('ltc'), ltcnet: query.get('ltcnet') ?? '', wallet: query.get('wallet') ?? '',
+  };
+  app.net = setup.ltcnet;
+  markSetup();
+  if (app.production) {
+    if (!setup.htlc) return fatal('Not on Ting yet', 'The HTLC program is not deployed on the production network yet.');
+  } else {
+    if (!setup.node || !setup.htlc || !setup.ltc) {
+      return fatal('This page needs its test setup', 'Open it with the address <code>node scripts/htlc-dev.mjs url</code> prints: it names the Ting node, the HTLC program, the DLR coin, Ting ID Web and the Litecoin explorer.');
+    }
+    if (!LTC_NETS.includes(app.net)) {
+      return fatal('Test networks only', `A test setup runs on Litecoin regtest or testnet, never on <code>${esc(app.net || 'mainnet')}</code>. Add <code>ltcnet=regtest</code> or <code>ltcnet=testnet</code> to the address.`);
+    }
+    // The node, the explorer, the wallet and the price source over https, or http on this computer only.
+    const insecure = ['node', 'ltc', 'wallet', 'price'].filter((name) => query.get(name) && query.get(name) !== 'off' && !safeUrl(query.get(name)));
+    if (insecure.length) {
+      return fatal('Only https addresses', `The page talks to its node, explorer, wallet and price source over https, or plain http on this computer only. Not: <code>${esc(insecure.join(', '))}</code>.`);
+    }
   }
-  if (!LTC_NETS.includes(app.net)) {
-    return fatal('Test networks only', `This page is a test setup: it runs on Litecoin regtest or testnet, never on <code>${esc(app.net || 'mainnet')}</code>. Add <code>ltcnet=regtest</code> or <code>ltcnet=testnet</code> to the address.`);
-  }
-  // The node, the explorer, the wallet and the price source over https, or http on this computer only.
-  const insecure = ['node', 'ltc', 'wallet', 'price'].filter((name) => query.get(name) && query.get(name) !== 'off' && !safeUrl(query.get(name)));
-  if (insecure.length) {
-    return fatal('Only https addresses', `The page talks to its node, explorer, wallet and price source over https, or plain http on this computer only. Not: <code>${esc(insecure.join(', '))}</code>.`);
-  }
-  app.node = new Node(safeUrl(nodeBase));
+  app.node = new Node(safeUrl(setup.node));
   let status;
   try {
     status = await app.node.status();
   } catch (e) {
     return fatal('Cannot reach the Ting node', `${esc(app.node.base)}: ${esc(e.message)}`);
   }
-  if (status.chain_id !== DEVELOPMENT) {
-    return fatal('Ting development chain only', `This page is a test setup and runs only on the Ting development chain. The node at <code>${esc(app.node.base)}</code> is on chain <code>${esc(status.chain_id)}</code>.`);
+  if (status.chain_id !== setup.chainId) {
+    return app.production
+      ? fatal('Not the Ting network', `The node at <code>${esc(app.node.base)}</code> is on chain <code>${esc(status.chain_id)}</code>, not Ting’s.`)
+      : fatal('Ting development chain only', `A test setup runs only on the Ting development chain. The node at <code>${esc(app.node.base)}</code> is on chain <code>${esc(status.chain_id)}</code>.`);
   }
   app.chainHex = status.chain_id;
   app.tip = { height: int(status.height), time: now() };
-  app.program = idOf(query.get('htlc'));
-  app.coin = idOf((query.get('coins') ?? '').split(',')[0]);
+  app.program = idOf(setup.htlc);
+  app.coin = idOf(setup.coin);
   if (!app.program || !app.coin) return fatal('The address is missing an id', 'It needs <code>htlc</code>, the program’s ContractId, and <code>coins</code>, the DLR coin’s.');
   app.vault = contractAccount(app.program);
-  app.wallet = query.get('wallet') ? safeUrl(query.get('wallet')) : '';
-  app.ltc = new Esplora(safeUrl(query.get('ltc')));
+  app.wallet = setup.wallet ? safeUrl(setup.wallet) : '';
+  app.ltc = new Esplora(safeUrl(setup.ltc));
   app.ltcWallet = app.net === 'regtest' ? new URL('/', app.ltc.base).href : '';
   const param = (name, fallback, min, max) => {
     const v = Number(query.get(name));
     return query.get(name) != null && Number.isInteger(v) && v >= min && v <= max ? v : fallback;
   };
-  app.confs = param('confs', 1, 0, 100);
-  app.tconfs = param('tconfs', TCONFS, 1, 1000);
-  app.ltcFee = param('ltcfee', null, 1, MAX_FEE_RATE);
+  if (app.production) {
+    app.confs = setup.confs;
+    app.tconfs = setup.tconfs;
+    app.ltcFee = null;
+  } else {
+    app.confs = param('confs', 1, 0, 100);
+    app.tconfs = param('tconfs', TCONFS, 1, 1000);
+    app.ltcFee = param('ltcfee', null, 1, MAX_FEE_RATE);
+  }
   try {
     const program = await app.node.contract(app.program);
     if (program.code_hash !== HTLC_CODE) {
@@ -3030,7 +3062,7 @@ async function boot() {
     if (b) copy(b.dataset.copy, b.dataset.done ?? 'Copied');
   });
   // LTC's price: the one kept from before at once, then read now and every ten minutes.
-  app.priceUrl = priceSource(query);
+  app.priceUrl = priceSource(app.production ? new URLSearchParams() : query);
   app.price = app.priceUrl ? savedPrice() : null;
   if (app.priceUrl) {
     readPrice();

@@ -8,9 +8,10 @@ which reveals the secret, and the seller's page uses it to claim the LTC. If any
 stalls, each side gets its coins back after a deadline. No server sits in between,
 and nobody holds anyone's coins: a program on Ting and a script on Litecoin do.
 
-**For now this is a test setup.** The page runs only against the Ting development
-chain and Litecoin regtest or testnet, and the program is deployed on the development
-chain only. See *A test setup* below to run a whole trade on your computer.
+**It is new.** The program runs on Ting's production network, and the page, opened as
+it is, trades real DLR for real LTC on Litecoin mainnet: start with small amounts.
+Opened with a test setup's address, it runs on the Ting development chain and Litecoin
+regtest instead; see *A test setup* below to run a whole trade on your computer.
 
 It is three pieces:
 
@@ -166,9 +167,16 @@ at <http://localhost:8766/web/>; the buyer pays from the dev wallet page.
 
 `web/` is the whole site. `.github/workflows/pages.yml` publishes it to GitHub Pages
 on every push to `main` that changes it (Settings → Pages → Source: GitHub Actions).
-Any static host works the same way. Until the HTLC program is deployed on the
-production network and the page is set up for it, a published page shows only that
-it runs on test chains.
+Any static host works the same way. The page runs on the production network as
+`LTC_PRODUCTION` in `web/js/config.js` pins it: node1, the HTLC program
+`bc0d789dc5b7338bd19d1e7d3723ed09b09885634063bba4389f7f2b2765447d`, Daler, Litecoin
+mainnet through litecoinspace.org and Ting ID Web. `node scripts/htlc-deploy.mjs` shows
+that deployment, and `--submit` sends it. To try it before publishing,
+`python3 scripts/serve.py 8770` and open <http://localhost:8770/>.
+
+Before publishing, serve it from a domain of its own: the page keeps its keys in the
+browser, and every project page under `ting-organization.github.io` shares one origin
+(HTLC.md, *Production*).
 
 ## The on-chain swap program
 
