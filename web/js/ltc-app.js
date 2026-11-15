@@ -831,10 +831,24 @@ function walletSentence(template, values, pay, shownAs = {}) {
 }
 
 /**
- * Hands an operation to Ting ID as a call link: the dialog with its QR code,
- * the link, and a button that opens it in Ting ID Web. The page watches the
- * program's events until it is done, then calls `done(true, executed)`;
- * `done(false)` when the dialog is closed first or the call fails.
+ * Which way to Ting ID suits this device: the Ting ID app on Android, which
+ * opens `ting:call` links; Ting ID Web on an iPhone or iPad, since Ting ID is
+ * an Android app; on a computer, the QR code for the app on a phone, or Ting
+ * ID Web.
+ */
+function device() {
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return 'android';
+  if (/iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) return 'ios';
+  return 'computer';
+}
+
+/**
+ * Hands an operation to Ting ID as a call link: the dialog with the ways to
+ * open it that suit this device (the app, Ting ID Web, the QR code) and the
+ * link itself. The page watches the program's events until it is done, then
+ * calls `done(true, executed)`; `done(false)` when the dialog is closed first
+ * or the call fails.
  */
 async function perform({ call, pay, label, from, feeCoin, notes = '', done }) {
   const link = await callLink({
@@ -845,15 +859,29 @@ async function perform({ call, pay, label, from, feeCoin, notes = '', done }) {
   const dialog = $('#call-dialog');
   let qr = null;
   try { qr = qrSvg(link); } catch { /* too long for a QR code */ }
+  const qrButton = qr ? `<button class="qr" aria-label="Show the QR code full screen">${qr}</button>` : '';
+  const kind = device();
+  const toApp = `<a class="button primary" id="open-app" href="${esc(link)}" autofocus>${icon('key')} Open in Ting ID</a>`;
+  const toWeb = (primary) => (app.wallet ? `<a class="button${primary ? ' primary' : ''}" id="open-wallet" href="${esc(walletUrl(link))}" target="_blank" rel="noopener"${primary ? ' autofocus' : ''}>${icon(primary ? 'key' : 'external')} ${primary ? 'Open in Ting ID Web' : 'Ting ID Web'}</a>` : '');
+  const copyButton = '<button id="copy-call">Copy link</button>';
+  // On a phone the code is for another device, so it folds away; on a computer it comes first, for the app on a phone.
+  const folded = qrButton ? `<details class="owner tech"><summary>Show the QR code, for Ting ID on another phone</summary>${qrButton}</details>` : '';
+  const ways = {
+    android: `<p class="hint">Opens the Ting ID app. If your identity is in Ting ID Web instead, open it there.</p>
+      <div class="row">${toApp}${toWeb(false)}${copyButton}</div>${folded}`,
+    ios: `<p class="hint">Opens Ting ID Web, which signs with your passkey. Ting ID itself is an Android app: if your identity is there, scan the QR code with it.</p>
+      <div class="row">${toWeb(true)}${copyButton}</div>${folded}`,
+    computer: `<p class="hint">${qrButton ? 'Scan the code with the Ting ID app on your phone, or open it in Ting ID Web if your identity is set up there.' : 'Too long for a QR code: open it in Ting ID Web, or copy the link to the phone that has Ting ID.'}</p>
+      <div class="row">${toWeb(!qrButton)}${copyButton}</div>`,
+  };
   $('.dialog-body', dialog).innerHTML = `<div class="eyebrow">Sign with Ting ID</div><h2>${esc(label)}</h2>
     <p class="call-sentence">${walletSentence(call.template, call.values, pay)}</p>
     ${notes}
     <p class="hint">${pay ? `Ting ID shows what leaves your account itself: ${dlr(pay.amount)} to the swap program, and the fee.` : 'Nothing leaves your account but the fee.'}</p>
-    <div class="call-pay">
-      ${qr ? `<button class="qr" aria-label="Show the QR code full screen">${qr}</button>` : '<p class="hint">Too long for a QR code: open it in Ting ID Web.</p>'}
+    <div class="call-pay ${kind}">
+      ${kind === 'computer' ? qrButton : ''}
       <div class="pay-side">
-        <p class="hint">Open it in Ting ID Web, in a new tab, or scan it with Ting ID.</p>
-        <div class="row">${app.wallet ? `<a class="button primary" id="open-wallet" href="${esc(walletUrl(link))}" target="_blank" rel="noopener" autofocus>${icon('key')} Open in Ting ID Web</a>` : ''}<button id="copy-call">Copy link</button></div>
+        ${ways[kind]}
         <p class="hint waiting" id="call-status"><span class="spinner" aria-hidden="true"></span> Waiting for you to approve it in Ting ID…</p>
       </div>
     </div>`;
