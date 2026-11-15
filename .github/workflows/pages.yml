@@ -31,10 +31,10 @@ jobs:
       - name: Stamp the commit into the page's URLs
         run: |
           v=${GITHUB_SHA::12}
-          sed -i -E "s#(href=\"style\.css|src=\"js/app\.js)\"#\1?v=$v\"#" web/index.html
-          sed -i -E "s#from '(\./[a-z0-9]+\.js)'#from '\1?v=$v'#" web/js/*.js
+          sed -i -E "s#(href=\"style\.css|src=\"js/ltc-app\.js)\"#\1?v=$v\"#" web/index.html
+          sed -i -E "s#from '(\./[a-z0-9-]+\.js)'#from '\1?v=$v'#" web/js/*.js
           grep -q "style.css?v=$v" web/index.html
-          grep -q "app.js?v=$v" web/index.html
+          grep -q "ltc-app.js?v=$v" web/index.html
           ! grep -nE "from ['\"]\.\.?/" web/js/*.js | grep -v "?v=$v'"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
