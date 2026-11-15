@@ -20,7 +20,8 @@ export const UNITS = 100_000_000n;
 
 /** The least time between the deadline on Ting and the lock's end on the other chain. */
 export const GAP = 21_600;
-export const MIN_WINDOW = 3_600;
+/** The least window: well above the 2 hours Ting's nodes let a block's stamp run ahead (HTLC.md, the claims). */
+export const MIN_WINDOW = 21_600;
 export const MAX_WINDOW = 604_800;
 
 const ZERO = new Uint8Array(32);

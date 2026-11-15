@@ -16,6 +16,9 @@
 //   address hashed by Node, and each way to spend it run through a small
 //   script interpreter of this file's own, whose signature checks are
 //   OpenSSL's over a BIP 143 preimage made here too.
+// - Sweeps of several locks in one claim or one refund: each input run
+//   through that interpreter against its own script and value, each
+//   signature checked by OpenSSL, dust worth less than its fee left out.
 //
 //   node scripts/test-ltc.mjs [rounds]
 //
@@ -1086,6 +1089,84 @@ group('spending the lock', () => {
   throws(() => L.claimTx({ ...lock, htlc: { ...HTLC, t1: 5 }, secret: SECRET, key: SELLER }), /T1/, 'a lock that is not one');
   const low = L.claimTx({ ...lock, value: 3000 + 2000, secret: SECRET, key: SELLER });
   check(L.parseTx(low.hex).outputs[0].value >= 2940, 'just above dust is fine');
+});
+
+group('sweeping several locks', () => {
+  const to = 'rltc1q3kquwp848h4juq7rl5q3wqsr29pd3d6wprzz8k';
+  // Three locks with the secret's hash and the seller's key: the real one, a copy
+  // with another buyer key and T1 (a copied take's), and one more at the real address.
+  const OTHER = keyOf('another buyer');
+  const second = { ...HTLC, buyer: S.publicKey(OTHER), t1: T1 + 3600 };
+  const inputs = [
+    { txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC },
+    { txid: hex(sha('a dust lock')), vout: 0, value: 3300, htlc: second },
+    { txid: hex(sha('more at the address')), vout: 2, value: 250_000, htlc: HTLC },
+  ];
+  const programOf = (h) => L.lockOutput(h, 'regtest').scriptPubKey.subarray(2);
+  /** OpenSSL's verdict on input `i`'s first witness item, over this file's own preimage. */
+  const signsInput = (tx, i, value, h, key) => {
+    const sig = tx.inputs[i].witness[0];
+    return sig[sig.length - 1] === 1 && derParts(sig.subarray(0, -1)).s <= HALF
+      && openssl(sha(preimage143(tx, i, L.htlcScript(h), value, 1)), sig.subarray(0, -1), key);
+  };
+  const shape = (built, name, { locktime, sequence, rate }) => {
+    const tx = L.parseTx(built.hex);
+    check(hex(L.serializeTx(built.tx)) === built.hex && L.txid(tx) === built.txid, `${name}: hex and txid agree`);
+    check(tx.version === 2 && tx.locktime === locktime, `${name}: version 2, nLockTime ${locktime}`);
+    check(tx.inputs.length === built.spent.length && tx.inputs.every((input, i) => input.txid === built.spent[i].txid && input.vout === built.spent[i].vout && input.sequence === sequence && !input.scriptSig.length), `${name}: ${tx.inputs.length} inputs, nSequence ${sequence.toString(16)}, no scriptSig`);
+    const total = built.spent.reduce((n, s) => n + s.value, 0);
+    check(tx.outputs.length === 1 && tx.outputs[0].value === total - built.fee && built.value === total - built.fee && hex(tx.outputs[0].script) === hex(L.addressToScript(to, 'regtest')), `${name}: one output of the inputs less the fee`);
+    check(built.vsize === L.vsize(tx) && built.fee >= Math.ceil(built.vsize * rate) && built.fee <= Math.ceil((built.vsize + tx.inputs.length) * rate), `${name}: a fee of ${built.fee} for ${built.vsize} vbytes at ${rate} a vbyte`);
+    return tx;
+  };
+
+  const claim = L.claimAllTx({ inputs, secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' });
+  const claimed = shape(claim, 'sweep claim', { locktime: 0, sequence: 0xffffffff, rate: 2 });
+  check(claim.spent.length === 3 && claim.skipped.length === 0, 'sweep claim: all three inputs, the dust one too at 2 a vbyte');
+  inputs.forEach((lock, i) => {
+    const why = run(claimed, i, lock.value, programOf(lock.htlc));
+    check(why === null, `sweep claim: input ${i} runs its own script${why ? ` (${why})` : ''}`);
+    check(signsInput(claimed, i, lock.value, lock.htlc, HTLC.seller), `sweep claim: input ${i} signed SIGHASH_ALL by the seller, as OpenSSL checks`);
+    check(hex(claimed.inputs[i].witness[1]) === hex(SECRET) && hex(claimed.inputs[i].witness[2]) === '01', `sweep claim: input ${i} is sig ‖ secret ‖ 01 ‖ script`);
+  });
+  const moved = structuredClone(claimed);
+  moved.outputs[0].value -= 1;
+  check(run(moved, 2, inputs[2].value, programOf(HTLC)) === 'NULLFAIL', 'sweep claim: a changed output fails every signature');
+  check(run(claimed, 1, inputs[2].value, programOf(second)) === 'NULLFAIL', 'sweep claim: each input signs its own value');
+  check(hex(L.secretFromWitness(claim.hex)) === hex(SECRET), 'sweep claim: the secret is found in it');
+
+  // At a high fee rate, an input worth less than it adds to the fee is left out.
+  const dear = L.claimAllTx({ inputs, secret: SECRET, key: SELLER, to, feeRate: 30, network: 'regtest' });
+  check(dear.spent.length === 2 && dear.skipped.length === 1 && dear.skipped[0].value === 3300, 'sweep claim at 30 a vbyte: the 3,300 litoshi output is skipped');
+  const dearTx = shape(dear, 'sweep claim at 30', { locktime: 0, sequence: 0xffffffff, rate: 30 });
+  check(run(dearTx, 0, VALUE, programOf(HTLC)) === null && run(dearTx, 1, 250_000, programOf(HTLC)) === null, 'sweep claim at 30: both inputs run');
+  const one = L.claimAllTx({ inputs: [inputs[0]], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' });
+  const single = L.claimTx({ ...inputs[0], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' });
+  check(one.hex === single.hex && one.fee === single.fee, 'one input: the same transaction as claimTx');
+  const dustFirst = L.claimAllTx({ inputs: [inputs[1], inputs[0]], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' });
+  check(dustFirst.spent[0].value === 3300 && dustFirst.spent[1].value === VALUE, 'dust first: still one transaction with both');
+
+  throws(() => L.claimAllTx({ inputs: [inputs[1]], secret: SECRET, key: SELLER, to, feeRate: 30, network: 'regtest' }), /less than the fee/, 'only dust: nothing to pay out');
+  throws(() => L.claimAllTx({ inputs: [inputs[0], { ...inputs[0] }], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' }), /named twice/, 'the same output twice');
+  throws(() => L.claimAllTx({ inputs: [], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' }), /no lock/, 'no input');
+  throws(() => L.claimAllTx({ inputs: [inputs[0], { ...inputs[1], htlc: { ...second, hash: sha('other') } }], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' }), /does not hash/, 'a lock with another hash');
+  throws(() => L.claimAllTx({ inputs: [inputs[0], { ...inputs[1], htlc: { ...second, seller: S.publicKey(OTHER) } }], secret: SECRET, key: SELLER, to, feeRate: 2, network: 'regtest' }), /seller key/, 'a lock of another seller');
+  throws(() => L.claimAllTx({ inputs, secret: SECRET, key: SELLER, to, feeRate: Number.NaN, network: 'regtest' }), /fee rate/, 'no fee rate');
+
+  // The buyer's refund of everything at the lock address and a lock with a later T1.
+  const refundInputs = [inputs[0], { ...inputs[1], htlc: { ...HTLC, t1: T1 + 3600 } }, inputs[2]];
+  const refund = L.refundAllTx({ inputs: refundInputs, key: BUYER, to, feeRate: 2, network: 'regtest' });
+  const refunded = shape(refund, 'sweep refund', { locktime: T1 + 3600, sequence: 0xfffffffe, rate: 2 });
+  refundInputs.forEach((lock, i) => {
+    const why = run(refunded, i, lock.value, programOf(lock.htlc));
+    check(why === null, `sweep refund: input ${i} runs its own script${why ? ` (${why})` : ''}`);
+    check(signsInput(refunded, i, lock.value, lock.htlc, HTLC.buyer), `sweep refund: input ${i} signed SIGHASH_ALL by the buyer, as OpenSSL checks`);
+  });
+  const early = structuredClone(refunded);
+  early.locktime = T1 + 3599;
+  check(run(early, 1, refundInputs[1].value, programOf(refundInputs[1].htlc)) === 'locktime not reached', 'sweep refund: before the latest T1, the latest lock fails');
+  check(L.refundAllTx({ inputs: [inputs[0]], key: BUYER, to, feeRate: 2, network: 'regtest' }).hex === L.refundTx({ ...inputs[0], key: BUYER, to, feeRate: 2, network: 'regtest' }).hex, 'one input: the same transaction as refundTx');
+  throws(() => L.refundAllTx({ inputs: [inputs[0], { ...inputs[1], htlc: second }], key: BUYER, to, feeRate: 2, network: 'regtest' }), /buyer key/, 'a lock of another buyer');
 });
 
 console.log(`${checks} checks, ${failures} failed`);

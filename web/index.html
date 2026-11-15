@@ -2,6 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Scripts from this site only; reads from the configured node, explorer and price source, which must be
+       https or on this computer (the page checks the same). frame-ancestors cannot be set from a meta tag. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ting Swap</title>
   <meta name="description" content="Trade DLR on Ting for LTC on Litecoin, with nobody sending first. A test setup on the Ting development chain and Litecoin regtest.">

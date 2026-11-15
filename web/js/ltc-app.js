@@ -27,11 +27,28 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const now = () => Math.floor(Date.now() / 1000);
 const esc = (text) => String(text).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** A number from a node or an explorer, as a number: anything else becomes 0, so that nothing it sends lands in the page as markup. */
+const int = (v) => (Number.isSafeInteger(Number(v)) ? Number(v) : 0);
+/** A transaction id or hash from a node or an explorer: 64 hex digits, or null. */
+const hexId = (v) => (typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v) ? v.toLowerCase() : null);
+
+/**
+ * An address the page may talk to or link: https, or http on this computer
+ * only, as a development setup has it. Null for anything else.
+ */
+function safeUrl(text) {
+  try {
+    const url = new URL(text);
+    if (url.protocol === 'https:') return url.href;
+    if (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return url.href;
+  } catch { /* not an address */ }
+  return null;
+}
 
 /** The only Ting chain this page runs on: the development chain. */
 const DEVELOPMENT = '8578787146be1ef0aacc797754001290272915e89cd9e5784fe1368e4c2131bc';
 /** htlc.wasm's CodeHash, as build.sh prints it. */
-const HTLC_CODE = '3681abef842aab9e7f06f72e69f61790be487a36d131b8c1651337f12fd578aa';
+const HTLC_CODE = '69012957b35f411457652e9c44004ada21396c3b038c2d86f32bfde339c331c7';
 /** The Litecoin networks this page runs on. Never mainnet. */
 const LTC_NETS = ['regtest', 'testnet'];
 /** T1 is the listing's window, the program's gap and this much more after the lock is made: time for the seller to accept. */
@@ -43,6 +60,28 @@ const TRADE_POLL = 4000;
 const MARKET_POLL = 10_000;
 /** A transaction the page sent that no node or explorer knows after this many seconds is sent again. */
 const RESEND_AFTER = 30;
+/**
+ * Ting's nodes admit a block stamped up to 2 hours ahead of their clocks, and
+ * claims and refunds go by the block's stamp. The buyer's page sends a first
+ * claim only while the deadline is more than that, and half an hour more, away:
+ * later, a seller who mines could put a refund in a block stamped past the
+ * deadline ahead of the claim, then claim the LTC with the secret it made
+ * public. A claim already sent is sent again until it is in.
+ */
+const CLOCK_SLACK = 7_200;
+const FIRST_CLAIM_BEFORE = CLOCK_SLACK + 1_800;
+/** How many Ting blocks an accept is buried under before the buyer's page claims, unless the address says otherwise. */
+const TCONFS = 30;
+/** The page reads the program's events of this many blocks below the tip again on every read, so that an event a reorganization dropped is dropped here too. */
+const REORG_WINDOW = 100;
+/** The most litoshi per vbyte the page pays, from the address or the explorer. */
+const MAX_FEE_RATE = 1000;
+/** An LTC claim waiting longer than this for a block gets a warning. */
+const SLOW_CLAIM = 1800;
+/** Outputs of takes that matter for no claim, read at most this many per round, so that free takes cannot flood the explorer. */
+const OTHER_READS = 8;
+/** An output Litecoin did not have, read again after this long; one that pays another script never again. */
+const MISSING_AGAIN = 300;
 /** Inside Discord's own browser, which can lose what a page keeps. */
 const DISCORD = /discord/i.test(navigator.userAgent);
 /**
@@ -93,6 +132,7 @@ class Esplora {
   txStatus(txid) { return this.request(`/tx/${txid}/status`); }
   outspend(txid, vout) { return this.request(`/tx/${txid}/outspend/${vout}`); }
   utxo(address) { return this.request(`/address/${encodeURIComponent(address)}/utxo`); }
+  addressTxs(address) { return this.request(`/address/${encodeURIComponent(address)}/txs`); }
   tipHash() { return this.request('/blocks/tip/hash', { text: true }); }
   block(hash) { return this.request(`/block/${hash}`); }
   fees() { return this.request('/v1/fees/recommended'); }
@@ -114,7 +154,7 @@ const app = {
   /** The regtest wallet page of scripts/ltc-dev.mjs, which stands in for the buyer's and seller's own Litecoin wallets. */
   ltcWallet: '',
   confs: 1,
-  tconfs: 3,
+  tconfs: TCONFS,
   /** What a claim pays now, from recent blocks (fees.js); null until read. */
   claimRate: null,
   /** Litoshi per vbyte for the page's Litecoin transactions; null asks the explorer. */
@@ -129,8 +169,14 @@ const app = {
   /** Ting's tip. */
   tip: { height: 0, time: 0 },
   tingError: null,
-  /** Litecoin as last read: the tip, outputs by `txid:vout`, unspent outputs by address, transactions' status by id. */
-  lt: { tip: null, outs: new Map(), utxos: new Map(), txs: new Map(), error: null },
+  /**
+   * Litecoin as last read: the tip, outputs by `txid:vout` (each with `at`, when
+   * it was read), unspent outputs by address, transactions' status by id, and
+   * what failed to read in the last round, by the same keys.
+   */
+  lt: { tip: null, outs: new Map(), utxos: new Map(), txs: new Map(), error: null, failed: new Map() },
+  /** What each trade's automatic steps last could not do, by listing. */
+  actionErrors: new Map(),
   /** What the current view does every second, when data changes, and what it reads every few seconds. */
   tick: null,
   onData: null,
@@ -324,29 +370,41 @@ async function loadListings() {
   return changed;
 }
 
-/** Reads the program's events since the last read. */
+/** What identifies an event in a block: to tell whether a read changed anything. */
+const eventMark = (e) => `${e.block}:${e.tx}:${e.kind}:${e.id}`;
+
+/**
+ * Reads the program's events: those since the last read, and again those of
+ * the last REORG_WINDOW blocks, in place of what was read of them before. An
+ * event a reorganization dropped is dropped here too, and one it moved gets its
+ * new block: depths are counted from blocks the node has now.
+ */
 async function loadEvents() {
-  let from = app.eventsFrom;
-  let added = 0;
+  const start = Math.max(1, Math.min(app.eventsFrom, app.tip.height - REORG_WINDOW));
+  const fresh = [];
+  let from = start;
   for (;;) {
     const page = await app.node.events(app.program, H.TOPIC, from, 100);
-    for (const block of page.items) {
-      for (const e of block.events) {
+    for (const block of page.items ?? []) {
+      for (const e of block.events ?? []) {
         try {
           const r = new Reader(unhex(e.payload_hex));
           r.take(32);
-          app.events.push({ ...H.decodeEvent(r), height: block.height, time: block.timestamp, tx: e.transaction });
-          added++;
+          fresh.push({ ...H.decodeEvent(r), height: int(block.height), time: int(block.timestamp), tx: hexId(e.transaction), block: hexId(block.block) });
         } catch { /* not one this page reads */ }
       }
     }
-    if (!page.items.length || page.next > page.height) {
-      app.eventsFrom = Math.max(from, page.next ?? from);
+    const next = int(page.next);
+    if (!page.items?.length || next > int(page.height) || next <= from) {
+      app.eventsFrom = Math.max(from, next || from);
       break;
     }
-    from = page.next;
+    from = next;
   }
-  return added > 0;
+  const kept = app.events.filter((e) => e.height < start);
+  const before = app.events.filter((e) => e.height >= start).map(eventMark).join();
+  app.events = [...kept, ...fresh];
+  return before !== fresh.map(eventMark).join();
 }
 
 let tingReading = null;
@@ -356,8 +414,9 @@ function refreshTing() {
   tingReading ??= (async () => {
     try {
       const status = await app.node.status();
-      const moved = status.height !== app.tip.height;
-      app.tip = { height: status.height, time: now() };
+      const height = int(status.height);
+      const moved = height !== app.tip.height;
+      app.tip = { height, time: now() };
       const [listings, events] = await Promise.all([loadListings(), loadEvents()]);
       app.tingError = null;
       if (events) findMyListings();
@@ -372,14 +431,31 @@ function refreshTing() {
   return tingReading;
 }
 
-/** A seller's trade whose listing was not seen yet finds it by its key in the listed events. */
+/**
+ * A seller's trade whose listing was not seen yet finds it by its key in the
+ * listed events. A key is public once its listing is on chain, and anyone can
+ * list again with it: the trade takes the transaction Ting ID sent when the
+ * page saw it, the account that made it when known, and otherwise the first
+ * listing with its key, which came before anyone could copy the key.
+ */
 function findMyListings() {
   if (!K.seed()) return;
   for (const t of myTrades()) {
     if (t.role !== 'seller' || t.listing) continue;
     const m = marksOf(t.n);
-    const listed = m && app.events.find((e) => e.kind === 'listed' && equal(e.key, m.pub));
-    if (listed) update(t, { listing: listed.id, listedTx: listed.tx });
+    if (!m) continue;
+    const listed = app.events.filter((e) => e.kind === 'listed' && equal(e.key, m.pub)
+      && (!t.listedTx || e.tx === t.listedTx) && (!t.maker || hex(e.maker) === t.maker))
+      .sort((a, b) => a.id - b.id)[0];
+    if (listed) update(t, { listing: listed.id, listedTx: listed.tx, maker: hex(listed.maker) });
+  }
+}
+
+/** Notes, for the seller's trade with key `pub`, the transaction and account that listed it: what Ting ID reported. */
+function pinListing(pub, tx, account) {
+  for (const t of myTrades()) {
+    const m = t.role === 'seller' && !t.listing ? marksOf(t.n) : null;
+    if (m && equal(m.pub, pub)) update(t, { listedTx: hexId(tx), maker: account ? hex(account) : null });
   }
 }
 
@@ -419,31 +495,68 @@ function lockOfTake(take) {
 /** Whether a listing is one this page trades: Litecoin, for the DLR it was given. */
 const forThisPage = (l) => l.chain === 'LTC' && equal(l.coin, app.coin) && l.key.length === 33 && isPublicKey(l.key);
 
-const matchesAccept = (take, acc) => acc && equal(take.taker, acc.taker) && equal(take.hash, acc.hash) && take.t1 === acc.t1;
-const releaseOf = (d, take) => take.lockOf && d.releases.find((r) => r.release.txid === take.lockOf.txid && r.release.vout === take.lockOf.vout);
+const matchesAccept = (take, acc) => Boolean(acc) && equal(take.taker, acc.taker) && equal(take.hash, acc.hash) && take.t1 === acc.t1;
 const depthOf = (height) => (height ? Math.max(0, app.tip.height - height + 1) : 0);
+const outKey = (lock) => `${lock.txid}:${lock.vout}`;
 
-/** The lock a take names, as the seller's page rebuilds it: its script, output and address. */
+const scripts = new Map();
+
+/** The lock a take names, as the seller's page rebuilds it: its script, output and address; null for lock bytes it cannot read. */
 function lockScript(terms, take) {
   const lock = take.lockOf;
   if (!lock) return null;
-  try {
-    const htlc = { tag: L.lockTag(app.program, terms.id, take.taker), hash: take.hash, seller: terms.key, buyer: lock.buyer, t1: take.t1 };
-    return { htlc, ...L.lockOutput(htlc, app.net), txid: lock.txid, vout: lock.vout };
-  } catch {
-    return null;
+  const key = `${terms.id}|${hex(terms.key)}|${hex(take.lock)}|${hex(take.taker)}|${hex(take.hash)}|${take.t1}`;
+  if (!scripts.has(key)) {
+    let made = null;
+    try {
+      const htlc = { tag: L.lockTag(app.program, terms.id, take.taker), hash: take.hash, seller: terms.key, buyer: lock.buyer, t1: take.t1 };
+      made = { htlc, ...L.lockOutput(htlc, app.net), txid: lock.txid, vout: lock.vout };
+    } catch { /* not a lock */ }
+    scripts.set(key, made);
   }
+  return scripts.get(key);
+}
+
+const releaseChecks = new Map();
+
+/**
+ * The seller's release of a take's lock: the first released event naming its
+ * output whose signature really releases that lock, checked against the
+ * script rebuilt from the take and the output's value as Litecoin has it.
+ * Anyone can post release data, as anyone can post a take: one whose
+ * signature does not verify is no release, and neither is one for an output
+ * this page has not read yet. Null without one.
+ */
+function releaseOf(d, take) {
+  const lock = lockScript(d.terms, take);
+  if (!lock) return null;
+  const out = outOf(lock.txid, lock.vout);
+  if (!out || out.missing || out.script !== hex(lock.scriptPubKey)) return null;
+  for (const r of d.releases) {
+    if (r.release.txid !== lock.txid || r.release.vout !== lock.vout) continue;
+    const key = `${hex(r.data)}|${hex(lock.script)}|${out.value}`;
+    if (!releaseChecks.has(key)) {
+      let ok = false;
+      try {
+        ok = L.verifyReleaseSignature({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, signature: r.release.signature });
+      } catch { /* not a signature */ }
+      releaseChecks.set(key, ok);
+    }
+    if (releaseChecks.get(key)) return r;
+  }
+  return null;
 }
 
 // ---- Reading Litecoin ------------------------------------------------------
 
 async function readTip() {
-  const hash = await app.ltc.tipHash();
+  const hash = hexId(await app.ltc.tipHash());
+  if (!hash) throw new ExplorerError('the explorer named no tip', 0);
   const block = await app.ltc.block(hash);
-  app.lt.tip = { height: block.height, hash, mtp: block.mediantime, time: block.timestamp };
+  app.lt.tip = { height: int(block?.height), hash, mtp: int(block?.mediantime), time: int(block?.timestamp) };
 }
 
-/** One output as the explorer has it: missing, or its value and script, its block and whether it is spent. */
+/** One output as the explorer has it, with when it was read: missing, or its value and script, its block and whether it is spent. */
 async function readOut(txidHex, vout) {
   const key = `${txidHex}:${vout}`;
   let tx;
@@ -451,69 +564,105 @@ async function readOut(txidHex, vout) {
     tx = await app.ltc.tx(txidHex);
   } catch (e) {
     if (e.status === 404 || e.status === 400) {
-      app.lt.outs.set(key, { missing: true });
+      app.lt.outs.set(key, { missing: true, at: now() });
       return;
     }
     throw e;
   }
-  const out = tx.vout[vout];
-  if (!out) {
-    app.lt.outs.set(key, { missing: true });
+  const out = Array.isArray(tx?.vout) ? tx.vout[vout] : null;
+  const value = int(out?.value);
+  if (!out || value <= 0 || typeof out.scriptpubkey !== 'string') {
+    app.lt.outs.set(key, { missing: true, at: now() });
     return;
   }
   const spend = await app.ltc.outspend(txidHex, vout);
   app.lt.outs.set(key, {
-    value: out.value, script: out.scriptpubkey, confirmed: tx.status.confirmed, height: tx.status.block_height ?? 0,
-    spent: Boolean(spend.spent), spender: spend.txid ?? null, spenderConfirmed: Boolean(spend.status?.confirmed),
-    spenderHeight: spend.status?.block_height ?? 0,
+    value, script: out.scriptpubkey.toLowerCase(), confirmed: tx.status?.confirmed === true, height: int(tx.status?.block_height),
+    spent: spend?.spent === true, spender: hexId(spend?.txid), spenderConfirmed: spend?.status?.confirmed === true,
+    spenderHeight: int(spend?.status?.block_height), at: now(),
   });
 }
 
 async function readTxStatus(id) {
   try {
     const s = await app.ltc.txStatus(id);
-    app.lt.txs.set(id, { found: true, confirmed: s.confirmed, height: s.block_height ?? 0 });
+    app.lt.txs.set(id, { found: true, confirmed: s?.confirmed === true, height: int(s?.block_height) });
   } catch (e) {
     if (e.status !== 404 && e.status !== 400) throw e;
     app.lt.txs.set(id, { found: false });
   }
 }
 
-/** Reads the tip, the outputs, addresses and transactions a view follows. */
-async function refreshLtc({ outs = [], addresses = [], txs = [] } = {}) {
+/** The unspent outputs at an address, as the explorer lists them, each checked to be one. */
+async function readUtxos(address) {
+  const list = await app.ltc.utxo(address);
+  app.lt.utxos.set(address, (Array.isArray(list) ? list : []).map((u) => ({
+    txid: hexId(u?.txid), vout: int(u?.vout), value: int(u?.value),
+    status: { confirmed: u?.status?.confirmed === true, block_height: int(u?.status?.block_height) },
+  })).filter((u) => u.txid && u.value > 0));
+}
+
+/**
+ * Reads Litecoin's tip, then what `first` asks for, then what `rest` asks
+ * for: outputs as `[txid, vout]`, addresses and transactions. Each read is on
+ * its own, so that one that fails (an unrelated take's output, say) stops no
+ * other; what failed is kept in `app.lt.failed` by its key. `app.lt.error`
+ * says only that Litecoin could not be read at all.
+ */
+async function refreshLtc(first = {}, rest = {}) {
   try {
     await readTip();
-    await Promise.all([
-      ...outs.map(([t, v]) => readOut(t, v)),
-      ...addresses.map(async (a) => app.lt.utxos.set(a, await app.ltc.utxo(a))),
-      ...txs.map((t) => readTxStatus(t)),
-    ]);
     app.lt.error = null;
   } catch (e) {
     app.lt.error = e.message;
+    return;
   }
+  const run = async ({ outs = [], addresses = [], txs = [] }) => {
+    const jobs = [
+      ...outs.map(([t, v]) => [`${t}:${v}`, () => readOut(t, v)]),
+      ...addresses.map((a) => [a, () => readUtxos(a)]),
+      ...txs.map((t) => [t, () => readTxStatus(t)]),
+    ];
+    const results = await Promise.allSettled(jobs.map(([, job]) => job()));
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') app.lt.failed.set(jobs[i][0], r.reason?.message ?? String(r.reason));
+      else app.lt.failed.delete(jobs[i][0]);
+    });
+  };
+  await run(first);
+  await run(rest);
 }
 
 const ltcDepth = (height) => (height && app.lt.tip ? Math.max(0, app.lt.tip.height - height + 1) : 0);
 const outOf = (txidHex, vout) => app.lt.outs.get(`${txidHex}:${vout}`);
 
+/**
+ * Litoshi per vbyte for the page's Litecoin transactions: the address's
+ * `ltcfee`, or the explorer's fastest rate, never under 2 nor over
+ * MAX_FEE_RATE. An answer that is not a number counts as none.
+ */
 async function feeRate() {
   if (app.ltcFee) return app.ltcFee;
   try {
-    const fees = await app.ltc.fees();
-    return Math.max(2, Math.ceil(fees.fastestFee ?? 2));
+    const fastest = Number((await app.ltc.fees())?.fastestFee);
+    if (!Number.isFinite(fastest) || fastest <= 0) return 2;
+    return Math.min(MAX_FEE_RATE, Math.max(2, Math.ceil(fastest)));
   } catch {
     return 2;
   }
 }
 
-/** Sends a Litecoin transaction; one the chain already has counts as sent. */
+/**
+ * Sends a Litecoin transaction; one the chain already has counts as sent.
+ * Throws otherwise, with `refused` when Litecoin itself turned it down, not
+ * when the explorer could not be reached.
+ */
 async function broadcast(txHex) {
   try {
     return await app.ltc.broadcast(txHex);
   } catch (e) {
     if (/already in (the )?(block ?chain|mempool)|txn-already-known|already known/i.test(e.message)) return null;
-    throw new Error(ltcWords(e));
+    throw Object.assign(new Error(ltcWords(e)), { refused: e.status === 400 });
   }
 }
 
@@ -708,7 +857,7 @@ async function watchCall(dialog, call, label, start, done) {
           callState(dialog, 'failed', 'It did not go through', `${esc(label)} failed: ${esc(failure(seen.receipt))}`);
           return done?.(false);
         }
-      } else if ((sent = await pooled(call.head, read))) {
+      } else if ((sent = hexId(await pooled(call.head, read)))) {
         callState(dialog, 'sent', 'Ting ID sent it', `Waiting for a block, a few seconds on this chain. Transaction ${txid(sent)}`);
       }
     } catch { /* the next look tries again */ }
@@ -724,7 +873,7 @@ async function findExecuted(operation, start) {
         const r = new Reader(unhex(e.payload_hex));
         r.take(32);
         const executed = decodeExecuted(r);
-        if (hex(executed.operation) === operation) return { height: block.height, account: executed.account, tx: e.transaction };
+        if (hex(executed.operation) === operation) return { height: int(block.height), account: executed.account, tx: hexId(e.transaction) };
       }
     }
     if (!page.items.length || page.next > page.height) return null;
@@ -764,7 +913,9 @@ function programInput(txHex) {
 
 /** Sends one of the program's own inputs; the transaction's id. */
 async function sendOwn(input) {
-  return app.node.submit(H.ownCall(app.program, input));
+  const id = hexId(await app.node.submit(H.ownCall(app.program, input)));
+  if (!id) throw new Error('the node answered with no transaction id');
+  return id;
 }
 
 /** Where a Ting transaction the page sent stands: done, failed, pending or missing. */
@@ -772,7 +923,7 @@ async function tingTx(id) {
   try {
     const answer = await app.node.transaction(id);
     const seen = answer.occurrences?.[0];
-    if (seen) return seen.receipt.status === 0 ? { state: 'done', height: seen.height } : { state: 'failed', height: seen.height, reason: failure(seen.receipt) };
+    if (seen) return seen.receipt?.status === 0 ? { state: 'done', height: int(seen.height) } : { state: 'failed', height: int(seen.height), reason: failure(seen.receipt ?? {}) };
     return { state: 'pending' };
   } catch (e) {
     if (e instanceof NodeError && e.status === 404) return { state: 'missing' };
@@ -832,24 +983,60 @@ function paymentOf(t) {
   return utxos.filter((u) => BigInt(u.value) >= BigInt(t.want)).sort((a, b) => Number(b.status.confirmed) - Number(a.status.confirmed))[0] ?? null;
 }
 
-/** The buyer's take among the listing's takes: its hash and receiving account. */
+/**
+ * The buyer's take among the listing's takes: the earliest that matches it
+ * exactly, its secret's hash, receiving account, T1 and key, and the output
+ * its page posted when it knows it. Anyone can post copies of a take, with
+ * other lock bytes or another T1: they are not this one.
+ */
 function takeOfBuyer(d, t) {
   const m = marksOf(t.n);
-  return d.takes.filter((x) => equal(x.hash, m.hash) && hex(x.taker) === t.receive).at(-1) ?? null;
+  if (!m) return null;
+  const posted = t.takeTx ?? t.take;
+  return d.takes.find((x) => x.lockOf && equal(x.hash, m.hash) && hex(x.taker) === t.receive && x.t1 === t.t1
+    && equal(x.lockOf.buyer, m.pub) && (!posted?.txid || (x.lockOf.txid === posted.txid && x.lockOf.vout === posted.vout))) ?? null;
+}
+
+/** The buyer's Litecoin release or refund, sent again while the explorer does not know it: one an explorer lost. */
+async function resendLtc(t) {
+  for (const sent of [t.releaseTx, ...Object.values(t.refundTxs ?? {})]) {
+    if (!sent?.hex) continue;
+    const s = app.lt.txs.get(sent.txid);
+    if (!s || s.found || now() - sent.at < RESEND_AFTER) continue;
+    await once(`resend:${sent.txid}`, async () => {
+      let error = null;
+      try {
+        await broadcast(sent.hex);
+      } catch (e) {
+        error = e.message;
+      }
+      // The time is noted whatever came of it, so that it is tried again later, not in every read.
+      if (t.releaseTx?.txid === sent.txid) update(t, { releaseTx: { ...t.releaseTx, at: now(), error } });
+      else update(t, { refundTxs: { ...t.refundTxs, [sent.txid]: { ...sent, at: now(), error } } });
+    });
+  }
 }
 
 /**
  * The buyer's page, by itself: posts the take once the payment is on
- * Litecoin; once the seller's accept names this taker, hash and T1 exactly and
- * is buried under `tconfs` Ting blocks, sends the claim, and sends it again
- * until it is buried too.
+ * Litecoin. Once the seller's accept names this taker, hash and T1 exactly,
+ * is buried under `tconfs` Ting blocks, and the lock record in the chain's
+ * state says the same, it sends the claim: a first claim only while the
+ * deadline is more than FIRST_CLAIM_BEFORE away; a claim it sent, it sends
+ * again until it is buried. It also sends its Litecoin release or refund
+ * again while the explorer does not know it.
  */
 async function autoBuyer(d, t) {
+  await resendLtc(t);
+  const m = marksOf(t.n);
   const take = takeOfBuyer(d, t);
   if (!take) {
     const pay = paymentOf(t);
     if (!pay || !d.open || d.accepted || d.withdrawn) return;
-    if (t.t1 < now() + d.terms.window + H.GAP + 60) return;
+    if (t.t1 < now() + d.terms.window + H.GAP + 60) {
+      if (!t.takeLate) update(t, { takeLate: true });
+      return;
+    }
     if (t.takeTx) {
       const s = await tingTx(t.takeTx.id).catch(() => null);
       if (s?.state === 'failed') {
@@ -859,33 +1046,48 @@ async function autoBuyer(d, t) {
       if (s?.state !== 'missing' || now() - t.takeTx.at < RESEND_AFTER) return;
     }
     await once(`take:${t.n}`, async () => {
-      const lock = L.encodeTakeLock({ txid: pay.txid, vout: pay.vout, buyer: marksOf(t.n).pub });
-      const input = H.takeInput({ id: d.id, taker: unhex(t.receive), hash: marksOf(t.n).hash, t1: t.t1, lock });
+      const lock = L.encodeTakeLock({ txid: pay.txid, vout: pay.vout, buyer: m.pub });
+      const input = H.takeInput({ id: d.id, taker: unhex(t.receive), hash: m.hash, t1: t.t1, lock });
       const id = await sendOwn(input);
       update(t, { takeTx: { id, txid: pay.txid, vout: pay.vout, value: pay.value, at: now() } });
     });
     return;
   }
-  if (!t.take || t.take.txid !== take.lockOf?.txid) update(t, { take: { txid: take.lockOf?.txid, vout: take.lockOf?.vout, tx: take.tx, height: take.height } });
+  if (t.take?.txid !== take.lockOf.txid || t.take?.vout !== take.lockOf.vout) {
+    update(t, { take: { txid: take.lockOf.txid, vout: take.lockOf.vout, tx: take.tx, height: take.height } });
+  }
   const acc = d.accepted;
-  if (!acc || !equal(acc.hash, marksOf(t.n).hash)) return;
-  const exact = equal(acc.taker, unhex(t.receive)) && acc.t1 === t.t1;
-  if (!exact) {
+  if (!acc || !equal(acc.hash, m.hash)) return;
+  if (!equal(acc.taker, unhex(t.receive)) || acc.t1 !== t.t1) {
     if (!t.acceptProblem) update(t, { acceptProblem: 'The accept names your hash but another account or T1 than your lock: the page will not claim.' });
     return;
   }
   if (depthOf(acc.height) < app.tconfs) return;
   if (d.claimed && depthOf(d.claimed.height) >= app.tconfs) return;
-  if (!d.claimed && now() > acc.deadline) return;
   if (t.claimTx) {
+    if (!d.claimed && now() > acc.deadline) return;
     const s = await tingTx(t.claimTx.id).catch(() => null);
     if (s?.state === 'failed' && !d.claimed) {
       if (t.claimTx.failed !== s.reason) update(t, { claimTx: { ...t.claimTx, failed: s.reason } });
       return;
     }
     if (s?.state !== 'missing' || now() - t.claimTx.at < RESEND_AFTER) return;
-  } else if (d.claimed) {
-    return;
+  } else {
+    if (d.claimed) return;
+    if (acc.deadline - now() <= FIRST_CLAIM_BEFORE) {
+      if (!t.claimTooLate) update(t, { claimTooLate: true });
+      return;
+    }
+    // The accept as the chain's state has it now, not only as an event read before: a
+    // reorganization can drop an accept, and a claim then would only make the secret public.
+    let lock = null;
+    try {
+      lock = H.decodeLock(d.id, await app.node.record(app.program, H.lockKey(d.id)));
+    } catch { /* not a lock this page reads */ }
+    if (!lock) throw new Error('the accept is not in the chain’s state: your page waits before claiming');
+    if (!equal(lock.taker, unhex(t.receive)) || !equal(lock.hash, m.hash) || lock.t1 !== t.t1) {
+      throw new Error('the lock on Ting names another account, hash or T1 than yours: your page does not claim');
+    }
   }
   await once(`claim:${t.n}`, async () => {
     const secret = K.secretAt(K.seed(), t.n);
@@ -894,15 +1096,20 @@ async function autoBuyer(d, t) {
   });
 }
 
-/** The outputs the seller's page can claim with the secret: every take matching the accept whose output pays its script. */
-function claimable(d) {
-  const out = [];
-  for (const take of d.takes) {
-    if (!matchesAccept(take, d.accepted)) continue;
-    const c = checkTakeAny(d.terms, take);
-    if (c) out.push(c);
-  }
-  return out;
+/**
+ * The take the accept was for, as the pages show it: the one this browser
+ * made the accept link for, or else the first matching take whose output
+ * holds the wanted amount, or else the first matching one. A dust take with
+ * the same taker, hash and T1 posted before it is not it.
+ */
+function acceptedTake(d) {
+  if (!d.accepted) return null;
+  const matching = d.takes.filter((x) => x.lockOf && matchesAccept(x, d.accepted));
+  const holds = (x) => {
+    const o = outOf(x.lockOf.txid, x.lockOf.vout);
+    return o && !o.missing && BigInt(o.value) >= BigInt(d.terms.want);
+  };
+  return matching.find((x) => d.seller?.accepting?.[outKey(x.lockOf)]) ?? matching.find(holds) ?? matching[0] ?? null;
 }
 
 function checkTakeAny(terms, take) {
@@ -910,74 +1117,244 @@ function checkTakeAny(terms, take) {
   if (!lock) return null;
   const o = outOf(lock.txid, lock.vout);
   if (!o || o.missing || o.script !== hex(lock.scriptPubKey)) return null;
-  return { ...lock, out: o, key: `${lock.txid}:${lock.vout}` };
+  return { ...lock, out: o, key: outKey(lock) };
 }
 
-/** The seller's page, by itself: once the claim on Ting shows the secret, claims every lock it opens to the payout address. */
+/**
+ * What the seller's page claims with the secret, the accepted lock first:
+ * every take matching the accept whose output pays the script rebuilt from
+ * it, and every other output at the accepted lock's address, which the secret
+ * opens too. The accepted lock is the one this page made the accept link for,
+ * or else the first that holds the wanted amount: a dust take posted before it
+ * comes after it.
+ */
+function claimable(d, t) {
+  const found = [];
+  const seen = new Set();
+  for (const take of d.takes) {
+    if (!matchesAccept(take, d.accepted)) continue;
+    const c = checkTakeAny(d.terms, take);
+    if (c && !seen.has(c.key)) {
+      seen.add(c.key);
+      found.push(c);
+    }
+  }
+  const main = found.find((c) => t?.accepting?.[c.key]) ?? found.find((c) => BigInt(c.out.value) >= BigInt(d.terms.want)) ?? found[0];
+  if (!main) return [];
+  const rest = found.filter((c) => c !== main);
+  for (const u of app.lt.utxos.get(main.address) ?? []) {
+    const key = `${u.txid}:${u.vout}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rest.push({
+      ...main, txid: u.txid, vout: u.vout, key, extra: true,
+      out: { value: u.value, script: hex(main.scriptPubKey), confirmed: u.status.confirmed, height: u.status.block_height, spent: false },
+    });
+  }
+  return [main, ...rest];
+}
+
+/**
+ * The seller's page, by itself: once the listing is accepted or withdrawn, it
+ * releases the other locks. Once the claim on Ting shows the secret, it sweeps
+ * every output the secret opens into one claim to the payout address, the
+ * accepted lock's alone if Litecoin refuses that; outputs not in a block yet,
+ * but the accepted one, wait for theirs, so that an output nobody vouches for
+ * cannot hold the claim back. A claim an explorer lost it sends again; one
+ * Litecoin refuses outright it gives up, and claims what is left anew.
+ */
 async function autoSeller(d, t) {
-  // Once one lock is accepted, or the listing withdrawn, no other lock can be:
-  // release each, so that its buyer takes the LTC back at once, not after it ends.
   if (d.accepted || d.withdrawn) await releaseOthers(d, t);
   if (!d.claimed) return;
-  const outs = claimable(d);
-  // Done once every lock it opens is spent in a block: by this page's claim, or one from a browser with the same backup code.
-  if (!t.done && outs.length && outs.every((c) => c.out.spent && c.out.spenderConfirmed)) update(t, { done: true });
-  for (const c of outs) {
-    const sent = t.ltcClaims?.[c.key];
-    if (c.out.spent) continue;
-    if (sent) {
-      const s = app.lt.txs.get(sent.txid);
-      if (s && !s.found && now() - sent.at > RESEND_AFTER) {
-        await once(`ltc-claim:${c.key}`, async () => {
-          await broadcast(sent.hex).catch((e) => update(t, { ltcClaimError: e.message }));
-          update(t, { ltcClaims: { ...t.ltcClaims, [c.key]: { ...sent, at: now() } } });
-        });
-      }
-      continue;
-    }
-    if (!t.payout) continue;
-    await once(`ltc-claim:${c.key}`, async () => {
-      const key = K.keyAt(K.seed(), t.n);
-      const tx = L.claimTx({ txid: c.txid, vout: c.vout, value: c.out.value, htlc: c.htlc, secret: d.claimed.secret, key, to: t.payout, feeRate: await feeRate(), network: app.net });
-      update(t, { ltcClaims: { ...(t.ltcClaims ?? {}), [c.key]: { txid: tx.txid, hex: tx.hex, fee: tx.fee, value: c.out.value - tx.fee, at: now() } }, ltcClaimError: null });
+  const outs = claimable(d, t);
+  const taken = outs.filter((c) => !c.extra);
+  if (!t.done && taken.length && taken.every((c) => c.out.spent && c.out.spenderConfirmed)) update(t, { done: true });
+  for (const s of Object.values(t.ltcClaims ?? {})) {
+    if (s.dead || !s.hex) continue;
+    const st = app.lt.txs.get(s.txid);
+    if (!st || st.found || now() - s.at < RESEND_AFTER) continue;
+    await once(`ltc-claim:${s.txid}`, async () => {
       try {
-        await broadcast(tx.hex);
-        toast('Your page claimed the LTC on Litecoin.', 'success', 8000);
+        await broadcast(s.hex);
+        update(t, { ltcClaims: { ...t.ltcClaims, [s.txid]: { ...s, at: now() } } });
       } catch (e) {
-        update(t, { ltcClaimError: e.message });
+        update(t, { ltcClaims: { ...t.ltcClaims, [s.txid]: { ...s, at: now(), dead: e.refused ? e.message : null } }, ltcClaimError: e.message });
       }
     });
   }
+  if (!t.payout || !outs.length) return;
+  const live = Object.values(t.ltcClaims ?? {}).filter((s) => !s.dead);
+  const covered = (c) => live.some((s) => (s.covers ?? s.inputs ?? [s.key]).includes(c.key));
+  const todo = outs.filter((c, i) => !c.out.spent && !covered(c) && (i === 0 || c.out.confirmed));
+  if (!todo.length) return;
+  await once('ltc-claim', async () => {
+    const rate = await feeRate();
+    const key = K.keyAt(K.seed(), t.n);
+    const build = (list) => L.claimAllTx({
+      inputs: list.map((c) => ({ txid: c.txid, vout: c.vout, value: c.out.value, htlc: c.htlc })),
+      secret: d.claimed.secret, key, to: t.payout, feeRate: rate, network: app.net,
+    });
+    const attempts = todo.length > 1 && todo[0] === outs[0] ? [todo, [todo[0]]] : [todo];
+    let last = null;
+    for (const list of attempts) {
+      try {
+        const tx = build(list);
+        await broadcast(tx.hex);
+        update(t, {
+          ltcClaims: {
+            ...(t.ltcClaims ?? {}),
+            [tx.txid]: { txid: tx.txid, hex: tx.hex, fee: tx.fee, value: tx.value, rate, covers: [...tx.spent, ...tx.skipped].map(outKey), at: now(), first: now() },
+          },
+          ltcClaimError: null,
+        });
+        toast('Your page claimed the LTC on Litecoin.', 'success', 8000);
+        return;
+      } catch (e) {
+        last = e;
+      }
+    }
+    update(t, { ltcClaimError: last.message });
+  });
 }
 
-/** Reads one trade from both chains, then does what this browser's part in it does by itself. */
-async function refreshTrade(id) {
-  await refreshTing();
-  const d = tradeOf(id);
-  const outs = [];
-  const seen = new Set();
+/**
+ * What the page reads of Litecoin for one listing, `t` the trade this browser
+ * has in it, if any: `first`, what a claim, a refund or the buyer's lock
+ * needs (the accepted lock and its address, the buyer's address and own
+ * take, the page's own transactions); `rest`, the other takes' locks, read a
+ * few at a time.
+ */
+function needsOf(d, t) {
+  const first = { outs: [], addresses: [], txs: [] };
+  const rest = [];
+  if (!d.terms || !forThisPage(d.terms)) return { first, rest };
+  const own = t?.role === 'buyer' ? takeOfBuyer(d, t) : null;
   for (const take of d.takes) {
-    if (take.lockOf && !seen.has(`${take.lockOf.txid}:${take.lockOf.vout}`)) {
-      seen.add(`${take.lockOf.txid}:${take.lockOf.vout}`);
-      outs.push([take.lockOf.txid, take.lockOf.vout]);
-    }
+    const lock = lockScript(d.terms, take);
+    if (!lock) continue;
+    if (matchesAccept(take, d.accepted) || take === own) first.outs.push([lock.txid, lock.vout]);
+    // After an accept, the other takes matter only to the seller, who releases them.
+    else if (!d.accepted || t?.role === 'seller') rest.push(lock);
   }
-  const addresses = d.buyer?.address ? [d.buyer.address] : [];
-  const txs = [
-    ...Object.values(d.seller?.ltcClaims ?? {}).map((c) => c.txid),
-    ...(d.buyer?.releaseTx ? [d.buyer.releaseTx.txid] : []),
-    ...Object.values(d.buyer?.refundTxs ?? {}).map((r) => r.txid),
-  ];
-  await refreshLtc({ outs, addresses, txs });
-  if (K.seed()) {
+  if (d.accepted && t?.role === 'seller') {
+    const main = claimable(d, t)[0];
+    if (main) first.addresses.push(main.address);
+  }
+  if (t?.role === 'buyer' && t.address) first.addresses.push(t.address);
+  for (const s of Object.values(t?.ltcClaims ?? {})) if (s.txid) first.txs.push(s.txid);
+  if (t?.releaseTx?.txid) first.txs.push(t.releaseTx.txid);
+  for (const r of Object.values(t?.refundTxs ?? {})) if (r.txid) first.txs.push(r.txid);
+  return { first, rest };
+}
+
+/**
+ * Which of the other takes' locks to read this round: at most OTHER_READS,
+ * those never read first, then those read longest ago. A lock missing from
+ * Litecoin is read again only after MISSING_AGAIN; an output that pays none
+ * of the scripts its takes name, or is spent in a block, never again. Takes
+ * cost nothing to post: so many cannot keep the explorer from what matters.
+ */
+function pickRest(locks) {
+  const byKey = new Map();
+  for (const lock of locks) byKey.set(outKey(lock), [...(byKey.get(outKey(lock)) ?? []), lock]);
+  const due = [];
+  for (const [key, group] of byKey) {
+    const o = app.lt.outs.get(key);
+    let when;
+    if (!o) when = 0;
+    else if (o.missing) when = now() - o.at > MISSING_AGAIN ? o.at : null;
+    else if (!group.some((l) => o.script === hex(l.scriptPubKey))) when = null;
+    else if (o.spent && o.spenderConfirmed) when = null;
+    else when = o.at ?? 0;
+    if (when != null) due.push([when, group[0]]);
+  }
+  return due.sort((a, b) => a[0] - b[0]).slice(0, OTHER_READS).map(([, l]) => [l.txid, l.vout]);
+}
+
+/** Whether a trade of this browser still has something for the page to do or watch. */
+function isActive(d, t) {
+  if (!d.terms) return true;
+  if (t.role === 'seller') return !t.done && !d.refunded && !(d.withdrawn && !d.accepted && t.releasedAll);
+  return !t.finished;
+}
+
+/**
+ * One round of reading and acting: Ting, then Litecoin for every open trade of
+ * this browser and the trade on screen, then each trade's automatic steps,
+ * whatever the view. One trade's failure is that trade's alone.
+ */
+async function round() {
+  await refreshTing();
+  const jobs = myTrades().filter((t) => t.listing && isActive(tradeOf(t.listing), t));
+  const firsts = [];
+  const rests = [];
+  const add = (d, t) => {
+    const n = needsOf(d, t);
+    firsts.push(n.first);
+    rests.push(...n.rest);
+  };
+  for (const t of jobs) {
     try {
-      if (d.buyer && !app.lt.error) await autoBuyer(d, d.buyer);
-      if (d.seller && !app.lt.error) await autoSeller(tradeOf(id), d.seller);
-      app.actionError = null;
+      add(tradeOf(t.listing), t);
     } catch (e) {
-      app.actionError = e.message;
+      app.actionErrors.set(t.listing, e.message);
     }
   }
+  if (app.viewing != null && !jobs.some((t) => t.listing === app.viewing)) {
+    const d = tradeOf(app.viewing);
+    try {
+      add(d, d.seller ?? d.buyer);
+    } catch { /* the view shows what it has */ }
+  }
+  const outs = new Map();
+  for (const f of firsts) for (const [txidHex, vout] of f.outs) outs.set(`${txidHex}:${vout}`, [txidHex, vout]);
+  const first = {
+    outs: [...outs.values()],
+    addresses: [...new Set(firsts.flatMap((f) => f.addresses))],
+    txs: [...new Set(firsts.flatMap((f) => f.txs))],
+  };
+  await refreshLtc(first, { outs: pickRest(rests).filter(([txidHex, vout]) => !outs.has(`${txidHex}:${vout}`)) });
+  app.readEvery = jobs.length || app.viewing != null ? TRADE_POLL : MARKET_POLL;
+  if (app.lt.error || !K.seed()) return;
+  for (const job of jobs) {
+    const t = myTrades().find((x) => x.n === job.n) ?? job;
+    try {
+      if (t.role === 'buyer') await autoBuyer(tradeOf(t.listing), t);
+      else await autoSeller(tradeOf(t.listing), t);
+      noteFinished(tradeOf(t.listing), myTrades().find((x) => x.n === t.n) ?? t);
+      app.actionErrors.delete(t.listing);
+    } catch (e) {
+      app.actionErrors.set(t.listing, e.message);
+    }
+  }
+}
+
+/**
+ * Marks a trade with nothing left to do: a seller's withdrawn listing whose
+ * other locks are all released, spent or not there; a buyer whose part is over
+ * (the DLR claimed and buried, or the LTC back) with nothing left at the lock
+ * address.
+ */
+function noteFinished(d, t) {
+  if (!d.terms) return;
+  if (t.role === 'seller') {
+    if (!d.withdrawn || d.accepted || t.releasedAll) return;
+    const open = d.takes.some((x) => {
+      const c = checkTake(d.terms, x);
+      if (!c.lock) return false;
+      if (!c.out) return true;
+      return !c.out.missing && !c.out.spent && c.out.script === hex(c.lock.scriptPubKey) && !releaseOf(d, x);
+    });
+    if (!open) update(t, { releasedAll: true });
+    return;
+  }
+  if (t.finished || !app.lt.utxos.has(t.address) || (app.lt.utxos.get(t.address) ?? []).length) return;
+  const take = takeOfBuyer(d, t);
+  const ours = take && matchesAccept(take, d.accepted);
+  const done = (ours && d.claimed && depthOf(d.claimed.height) >= app.tconfs)
+    || (t.releaseTx && app.lt.txs.get(t.releaseTx.txid)?.confirmed)
+    || Object.values(t.refundTxs ?? {}).some((r) => app.lt.txs.get(r.txid)?.confirmed);
+  if (done) update(t, { finished: true });
 }
 
 // ---- Routing ---------------------------------------------------------------
@@ -987,7 +1364,7 @@ function route() {
   app.leave = null;
   app.tick = null;
   app.onData = null;
-  app.reader = null;
+  app.viewing = null;
   app.onPrice = null;
   const [, view, arg] = location.hash.split('/');
   $$('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === (view || 'market')));
@@ -1025,7 +1402,10 @@ function banners() {
   if (myTrades().length && !K.backedUp() && !location.hash.startsWith('#/backup')) {
     out.push(`<div class="callout warn">${icon('key')}<div><b>Save your backup code.</b> Your trades’ keys live only in this browser: clearing it loses them, and the coins they lock, unless you have the code. <a href="#/backup">Show my backup code</a></div></div>`);
   }
-  if (app.actionError) out.push(`<div class="callout bad">${icon('alert')}<div><b>Your page could not act just now:</b> ${esc(app.actionError)}. It tries again with the next read.</div></div>`);
+  for (const [id, message] of app.actionErrors) {
+    if (app.viewing != null && app.viewing !== id) continue;
+    out.push(`<div class="callout bad">${icon('alert')}<div><b>Your page could not act on listing #${int(id)} just now:</b> ${esc(message)}. It tries again with the next read.</div></div>`);
+  }
   if (app.tingError) out.push(`<div class="callout bad">${icon('alert')}<div><b>Cannot read Ting right now.</b> ${esc(app.tingError)}. The page tries again every few seconds. <button class="link" data-retry>Retry now</button></div></div>`);
   return out.length ? `<div class="banners">${out.join('')}</div>` : '';
 }
@@ -1052,8 +1432,11 @@ function stepOf(t) {
   if (d.claimed && take && matchesAccept(take, d.accepted)) return { text: `Done: you got ${dlrPlain(d.claimed.paid)} ${app.dlr.symbol}`, tone: 'done' };
   if (t.releaseTx) return { text: 'Released: your LTC is back', tone: 'off' };
   if (t.refundTxs && Object.keys(t.refundTxs).length) return { text: 'Refunded: your LTC is back', tone: 'off' };
+  if (!take && (t.takeTx?.failed || t.takeLate)) return { text: 'No take posted: your LTC comes back after its lock ends', tone: 'act' };
   if (!take) return t.takeTx ? { text: 'Payment seen: posting your take', tone: 'wait' } : { text: `Send ${ltcPlain(t.want)} LTC to your lock`, tone: 'act' };
-  if (d.accepted && matchesAccept(take, d.accepted)) return { text: 'Accepted: your page claims the DLR', tone: 'act' };
+  if (d.accepted && matchesAccept(take, d.accepted)) {
+    return !t.claimTx && t.claimTooLate ? { text: 'Too late to claim safely: your LTC comes back', tone: 'act' } : { text: 'Accepted: your page claims the DLR', tone: 'act' };
+  }
   if (releaseOf(d, take)) return { text: 'The seller released your lock: take your LTC back', tone: 'act' };
   if (d.accepted || d.withdrawn) return { text: 'Not accepted: your LTC comes back', tone: 'act' };
   return { text: 'Locked: waiting for the seller to accept', tone: 'wait' };
@@ -1064,13 +1447,16 @@ function marketRow(l) {
   const d = tradeOf(l.id);
   const locks = d.takes.filter((x) => !releaseOf(d, x)).length;
   const forOne = !H.isZero(l.taker);
+  // What the buyer's page refuses to lock for: offered as a view, not as a buy.
+  const refused = l.window < H.MIN_WINDOW ? `held only ${span(l.window)} once accepted: too short to claim safely`
+    : BigInt(l.fee) * 1000n > BigInt(l.amount) ? 'its claim pays more than a thousandth in fees' : '';
   return `<article class="listing ltc-row${yours ? ' own' : ''}" data-id="${l.id}">
     <a class="listing-link" href="#/l/${l.id}" aria-label="Listing ${l.id}"></a>
     <div class="leg get"><span class="label">You get</span>${dlr(l.amount)}</div>
     <div class="leg pay"><span class="label">You pay</span>${ltc(l.want)}${usd(l.want)}</div>
     <div class="leg rate"><span class="label">Rate</span><span class="rate-text">${rateText(l.amount, l.want)}</span></div>
-    <div class="leg meta"><span class="label">#${l.id} · held ${span(l.window)} once accepted</span><span class="meta-line">${yours ? '<span class="badge mine">Your listing</span>' : who(l.maker)}${forOne ? `<span class="badge for-one" title="Only ${hex(l.taker)} can take it">For one buyer</span>` : ''}${locks ? `<span class="badge taken">${plural(locks, 'lock')}</span>` : ''}</span></div>
-    <div class="leg act">${yours ? `<a class="button" href="#/l/${l.id}">Open</a>` : `<a class="button primary" href="#/l/${l.id}">Buy with LTC</a>`}</div>
+    <div class="leg meta"><span class="label">#${l.id} · held ${span(l.window)} once accepted</span><span class="meta-line">${yours ? '<span class="badge mine">Your listing</span>' : who(l.maker)}${forOne ? `<span class="badge for-one" title="Only ${hex(l.taker)} can take it">For one buyer</span>` : ''}${locks ? `<span class="badge taken">${plural(locks, 'lock')}</span>` : ''}${refused ? `<span class="badge refused" title="${esc(refused)}">Not buyable here</span>` : ''}</span></div>
+    <div class="leg act">${yours ? `<a class="button" href="#/l/${l.id}">Open</a>` : refused ? `<a class="button" href="#/l/${l.id}">View</a>` : `<a class="button primary" href="#/l/${l.id}">Buy with LTC</a>`}</div>
   </article>`;
 }
 
@@ -1140,8 +1526,6 @@ function renderMarket(main) {
   };
   draw();
   app.onData = draw;
-  app.reader = async () => { await refreshTing(); };
-  app.readEvery = MARKET_POLL;
 }
 
 function wireCommon(main) {
@@ -1203,7 +1587,7 @@ function renderSell(main) {
             <input id="sell-payout" name="payout" class="mono" placeholder="${app.net === 'regtest' ? 'rltc1…' : 'tltc1…'}" value="${esc(form.payout)}" spellcheck="false">
             <span class="hint" id="payout-hint">Your page claims the LTC to this address by itself.</span></label>
           <details class="owner"${form.taker || form.hours !== '12' ? ' open' : ''}><summary>More options</summary>
-            <label class="field"><span>Lock window, hours</span><input id="sell-hours" name="hours" type="number" min="1" max="168" step="1" value="${esc(form.hours)}">
+            <label class="field"><span>Lock window, hours</span><input id="sell-hours" name="hours" type="number" min="${H.MIN_WINDOW / 3600}" max="${H.MAX_WINDOW / 3600}" step="1" value="${esc(form.hours)}">
               <span class="hint">How long the DLR wait for the buyer once you accept.</span></label>
             <label class="field wide-field"><span>Only for one buyer</span><input id="sell-taker" name="taker" class="mono" placeholder="Their Ting account, or leave empty for anyone" value="${esc(form.taker)}" spellcheck="false"></label></details>
           <div class="preview" id="preview"></div>
@@ -1235,7 +1619,7 @@ function renderSell(main) {
     if (form.amount && !(amount > 0n)) problems.push(`The DLR amount is a number with at most ${app.dlr.decimals} decimals.`);
     if (form.want && !(want > 0n)) problems.push('The LTC amount is a number with at most 8 decimals.');
     if (want > BigInt(L.MAX_MONEY)) problems.push('That is more LTC than there will ever be.');
-    if (!Number.isInteger(hours) || hours < 1 || hours > 168) problems.push('The lock window is whole hours, from 1 to 168.');
+    if (!Number.isInteger(hours) || hours * 3600 < H.MIN_WINDOW || hours * 3600 > H.MAX_WINDOW) problems.push(`The lock window is whole hours, from ${H.MIN_WINDOW / 3600} to ${H.MAX_WINDOW / 3600}: less would leave the buyer too little time to claim safely.`);
     if (form.taker.trim() && !taker) problems.push('The buyer’s account is 64 hex digits, or their ting:pay link.');
     const payoutProblem = addressProblem(form.payout);
     const ready = amount > 0n && want > 0n && !problems.length && form.payout.trim() && !payoutProblem;
@@ -1286,7 +1670,7 @@ function accountOf(text) {
 async function sell(v, payout) {
   if (!v.ready) return;
   await ensureSeed();
-  const n = K.takeCounter();
+  const n = await freshCounter();
   const key = K.keyAt(K.seed(), n);
   const trade = K.saveTrade(app.program, {
     n, role: 'seller', listing: null, created: Date.now(), payout, amount: String(v.amount), want: String(v.want),
@@ -1304,12 +1688,33 @@ async function offer(trade, pub = marksOf(trade.n).pub) {
   await perform({
     call, pay: { coin: app.coin, to: app.vault, amount: BigInt(trade.amount) }, label: 'List DLR for LTC',
     notes: '<p class="hint">The key is this browser’s new Litecoin key for this trade: the LTC can be claimed only with it.</p>',
-    done: (ok) => {
+    done: (ok, executed) => {
       if (!ok) return;
+      // The listing is the one this call made: its transaction, by the account that approved it.
+      if (executed) pinListing(pub, executed.tx, executed.account);
       findMyListings();
       const t = myTrades().find((x) => x.n === trade.n);
       location.hash = t?.listing ? `#/l/${t.listing}` : '#/';
     },
+  });
+}
+
+/**
+ * The counter for a new trade. The program's events are read first: a
+ * counter whose key a listed event already shows, or whose secret's hash a
+ * taken event does, is skipped (a backup code used in two browsers, or a
+ * restore that could not see a lock nobody took), and so is any a trade of
+ * this browser holds. Never two locks with one secret.
+ */
+async function freshCounter() {
+  await refreshTing();
+  if (app.tingError) throw new Error(`Cannot read Ting to check this browser’s next key: ${app.tingError}`);
+  const pubs = new Set(app.events.filter((e) => e.kind === 'listed').map((e) => hex(e.key)));
+  const hashes = new Set(app.events.filter((e) => e.kind === 'taken').map((e) => hex(e.hash)));
+  const s = K.seed();
+  return K.takeCounter((n) => {
+    const m = K.marksAt(s, n);
+    return !m || pubs.has(hex(m.pub)) || hashes.has(hex(m.hash));
   });
 }
 
@@ -1323,11 +1728,13 @@ function renderTrade(main, id) {
     if (active && main.contains(active) && active.matches('input, textarea')) return;
     paint(main, tradeHtml(id, form), () => wireTrade(main, id, form, draw));
   };
+  app.viewing = id;
+  app.readEvery = TRADE_POLL;
   draw();
   app.onData = draw;
-  app.reader = () => refreshTrade(id);
-  app.readEvery = TRADE_POLL;
   app.tick = tickTimes;
+  // A trade opened from the market is read at once, not at the next round.
+  read().catch(() => {});
 }
 
 function tickTimes() {
@@ -1427,7 +1834,11 @@ const shareButton = (d) => `<button data-share data-copy="${esc(shareText(d))}" 
 
 function sellerPanel(d, t, form) {
   const l = d.terms;
-  if (d.claimed) return sellerClaimedPanel(d, t, form);
+  if (d.claimed) {
+    // The other buyers' locks stay in view after the swap: the seller sees that each was released.
+    const others = takeRows(d, { seller: true, skipAccepted: true });
+    return sellerClaimedPanel(d, t, form) + (others ? panel('Other buyers’ locks', `<p class="hint">Your page released them, so those buyers can take their LTC back at once.</p>${others}`) : '');
+  }
   if (d.refunded) return panel('Your DLR are back', `<p>The buyer did not claim in time, so the program sent the ${esc(app.dlr.symbol)} back to your account.</p>`, 'done');
   if (d.accepted) {
     const acc = d.accepted;
@@ -1442,7 +1853,7 @@ function sellerPanel(d, t, form) {
       ${nextLine(`Keep this page open, or come back before ${esc(localTime(acc.t1))}.`)}
       ${payoutField(t, form)}
       <div class="row">${shareButton(d)}</div>
-      ${others ? `<h3>Other buyers’ locks</h3><p class="hint">Your page releases them by itself, so that those buyers take their LTC back now.</p>${others}` : ''}`, 'wait');
+      ${others ? `<h3>Other buyers’ locks</h3><p class="hint">Your page releases them by itself, so that those buyers take their LTC back now.</p>${t.releaseError ? `<div class="callout bad">${icon('alert')}<div><b>A release did not go out:</b> ${esc(t.releaseError)}. Your page tries again.</div></div>` : ''}${others}` : ''}`, 'wait');
   }
   if (d.withdrawn) {
     const rows = takeRows(d, { seller: true });
@@ -1476,29 +1887,36 @@ function takeRows(d, { seller = false, skipAccepted = false } = {}) {
     if (skipAccepted && accepted) continue;
     const released = releaseOf(d, take);
     const c = checkTake(d.terms, take);
+    const key = c.lock ? outKey(c.lock) : null;
+    const sentRelease = Boolean(key && d.seller?.releases?.[key]);
+    const linkOut = Boolean(key && d.open && d.seller?.accepting?.[key]);
     let line, tone;
     if (accepted) {
       line = 'Accepted'; tone = 'ok';
     } else if (released) {
       line = `Released in block ${released.height}: ${c.out?.spent ? 'the buyer took the LTC back' : 'the buyer can take the LTC back at once'}`; tone = 'off';
+    } else if (sentRelease && seller) {
+      line = 'Released by your page: waiting for a Ting block'; tone = 'off';
     } else {
       line = c.words; tone = c.state;
     }
-    const canRelease = seller && !accepted && !released && c.lock && c.out && !c.out.missing && !c.out.spent && c.out.script === hex(c.lock.scriptPubKey);
-    const canAccept = seller && !d.accepted && !d.withdrawn && !released && c.state === 'ok';
+    const lockThere = c.lock && c.out && !c.out.missing && !c.out.spent && c.out.script === hex(c.lock.scriptPubKey);
+    const canRelease = seller && !accepted && !released && !sentRelease && !linkOut && lockThere;
+    const canAccept = seller && !d.accepted && !d.withdrawn && !released && !sentRelease && c.state === 'ok';
     // Shown, but not usable yet, while the lock waits for its confirmations.
-    const soon = seller && !d.accepted && !d.withdrawn && !released && c.state === 'wait';
+    const soon = seller && !d.accepted && !d.withdrawn && !released && !sentRelease && c.state === 'wait';
     const lockAddr = c.lock ? c.lock.address : null;
     rows.push(`<div class="take ${tone}">
       <div class="take-head"><span class="check-dot ${tone}" aria-hidden="true"></span><b>Lock ${take.index + 1}</b> <span class="muted">by ${who(take.taker)} · block ${take.height}</span></div>
       <p class="check-line ${tone}">${esc(line)}${!accepted && !released && (c.state === 'ok' || c.state === 'wait') ? usd(c.out.value) : ''}</p>
+      ${seller && linkOut && !accepted ? `<p class="hint">You opened an accept link for this lock. While the listing is open, your page does not release it: that link can still be approved.</p>` : ''}
       <details class="owner tech"><summary>Details</summary><dl class="mini">
-        ${c.lock ? `<div><dt>Litecoin</dt><dd>${txid(c.lock.txid)} <span class="muted">output ${c.lock.vout}</span></dd></div>` : ''}
+        ${c.lock ? `<div><dt>Litecoin</dt><dd>${txid(c.lock.txid)} <span class="muted">output ${int(c.lock.vout)}</span></dd></div>` : ''}
         ${lockAddr ? `<div><dt>Lock address</dt><dd><code class="addr">${esc(lockAddr)}</code></dd></div>` : ''}
         <div><dt>Lock ends</dt><dd>${when(take.t1)}</dd></div>
-        <div><dt>Take on Ting</dt><dd>${txid(take.tx)}</dd></div>
+        <div><dt>Take on Ting</dt><dd>${take.tx ? txid(take.tx) : '—'}</dd></div>
       </dl></details>
-      ${canAccept || canRelease || soon ? `<div class="row">${canAccept ? `<button class="primary" data-accept="${take.index}">${icon('check')} Accept with Ting ID</button>` : soon ? `<button class="primary" disabled title="Usable once the lock has ${app.confs} confirmation${app.confs === 1 ? '' : 's'}">${icon('check')} Accept with Ting ID</button>` : ''}${canRelease ? `<button data-release="${take.index}">${accepted ? '' : d.accepted || d.withdrawn ? 'Release' : 'Decline and release'}</button>` : ''}</div>` : ''}
+      ${canAccept || canRelease || soon ? `<div class="row">${canAccept ? `<button class="primary" data-accept="${take.index}">${icon('check')} Accept with Ting ID</button>` : soon ? `<button class="primary" disabled title="Usable once the lock has ${app.confs} confirmation${app.confs === 1 ? '' : 's'}">${icon('check')} Accept with Ting ID</button>` : ''}${canRelease ? `<button data-release="${take.index}">${d.accepted || d.withdrawn ? 'Release' : 'Decline and release'}</button>` : ''}</div>` : ''}
     </div>`);
   }
   return rows.length ? `<div class="takes">${rows.join('')}</div>` : '';
@@ -1512,18 +1930,25 @@ function payoutField(t, form) {
 
 function sellerClaimedPanel(d, t, form) {
   const l = d.terms;
-  const claims = Object.entries(t.ltcClaims ?? {});
-  const outs = claimable(d);
-  const confirmed = claims.filter(([, c]) => app.lt.txs.get(c.txid)?.confirmed);
-  const lines = claims.map(([, c]) => {
+  const claims = Object.values(t.ltcClaims ?? {}).filter((c) => !c.dead);
+  const outs = claimable(d, t);
+  const main = outs[0];
+  const status = (c) => {
     const s = app.lt.txs.get(c.txid);
-    const depth = s?.confirmed ? ltcDepth(s.height) : 0;
-    return `<div><dt>LTC claim</dt><dd>${txid(c.txid)} <span class="muted">${s?.confirmed ? `${plural(depth, 'confirmation')}` : s?.found ? 'waiting for a block' : 'sent'}</span></dd></div>`;
-  }).join('');
-  const unspent = outs.filter((c) => !c.out.spent);
-  const elsewhere = outs.filter((c) => c.out.spent && !claims.some(([, x]) => x.txid === c.out.spender));
-  if (!unspent.length && elsewhere.length) {
-    const e = elsewhere[0].out;
+    if (s?.confirmed) return plural(ltcDepth(s.height), 'confirmation');
+    if (s && !s.found) return 'not seen by the explorer: your page sends it again';
+    return 'waiting for a block';
+  };
+  const lines = claims.map((c) => `<div><dt>LTC claim</dt><dd>${txid(c.txid)} <span class="muted">${ltcText(c.value)} LTC · ${status(c)}</span></dd></div>`).join('');
+  const byUs = (spender) => claims.some((c) => c.txid === spender);
+  if (!main) {
+    const take = acceptedTake(d);
+    const o = take && outOf(take.lockOf.txid, take.lockOf.vout);
+    if (o?.missing) return panel('The accepted lock is not on Litecoin', `<p>The explorer has no output ${txid(take.lockOf.txid)}:${int(take.lockOf.vout)}. The page cannot claim it.</p>`, 'bad');
+    return panel('The buyer claimed: reading the lock', `${waiting('Reading the accepted lock on Litecoin…')}`, 'act');
+  }
+  if (main.out.spent && !byUs(main.out.spender)) {
+    const e = main.out;
     // Before T1 only the seller's key with the secret can spend the lock: a claim from another browser with this backup code.
     if (app.lt.tip && app.lt.tip.mtp <= d.accepted.t1) {
       return panel('Done: the LTC was claimed', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and the lock was claimed with this trade’s key in ${txid(e.spender)} (${e.spenderConfirmed ? plural(ltcDepth(e.spenderHeight), 'confirmation') : 'waiting for a block'}): by a browser with your backup code.</p>
@@ -1531,21 +1956,21 @@ function sellerClaimedPanel(d, t, form) {
     }
     return panel('The LTC lock was spent by another transaction', `<p>The lock was spent by ${txid(e.spender)}, after the buyer’s lock ended: most likely the buyer’s refund.</p>`, 'bad');
   }
-  if (!outs.length) {
-    const take = d.takes.find((x) => matchesAccept(x, d.accepted));
-    const o = take?.lockOf && outOf(take.lockOf.txid, take.lockOf.vout);
-    if (o?.missing) return panel('The accepted lock is not on Litecoin', `<p>The explorer has no output ${txid(take.lockOf.txid)}:${take.lockOf.vout}. The page cannot claim it.</p>`, 'bad');
-  }
-  if (unspent.length && !t.payout) return panel('The buyer claimed: where should your LTC go?', `<p>The secret is on Ting now. Your page claims the ${ltc(l.want)} as soon as it knows your address.</p>${payoutField(t, form)}`, 'act');
-  if (confirmed.length && confirmed.length === claims.length) {
-    const got = claims.reduce((s, [, c]) => s + c.value, 0);
-    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your page claimed ${ltc(got)}${usd(got)} to <code>${esc(t.payout)}</code> (after a Litecoin fee of ${ltcText(claims.reduce((s, [, c]) => s + c.fee, 0))} LTC).</p>
+  if (!main.out.spent && !t.payout) return panel('The buyer claimed: where should your LTC go?', `<p>The secret is on Ting now. Your page claims the ${ltc(l.want)} as soon as it knows your address.</p>${payoutField(t, form)}`, 'act');
+  if (main.out.spent && main.out.spenderConfirmed) {
+    const done = claims.filter((c) => app.lt.txs.get(c.txid)?.confirmed);
+    const got = done.reduce((s, c) => s + c.value, 0);
+    const later = outs.filter((c) => c !== main && !c.out.spent);
+    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your page claimed ${ltc(got)}${usd(got)} to <code>${esc(t.payout)}</code> (after a Litecoin fee of ${ltcText(done.reduce((s, c) => s + c.fee, 0))} LTC).</p>
       <dl class="lines mini-lines">${lines}</dl>
+      ${later.length ? `<p class="hint">${plural(later.length, 'more output')} at the lock’s address, ${ltcText(later.reduce((s, c) => s + c.out.value, 0))} LTC in all: your page claims ${later.length === 1 ? 'it' : 'them'} once in a block, if worth the fee.</p>` : ''}
       ${app.ltcWallet ? `<p class="hint">In this test setup, see it in the <a href="${esc(app.ltcWallet)}" target="_blank" rel="noopener">Litecoin regtest wallet</a> (Alice).</p>` : ''}
       <div class="row">${shareButton(d)}</div>`, 'done');
   }
-  return panel('The buyer claimed: claiming your LTC', `<p>The buyer’s claim revealed the secret on Ting in block ${d.claimed.height}. Your page uses it to claim the ${ltc(l.want)} to <code>${esc(t.payout)}</code>.</p>
+  const slow = claims.find((c) => !app.lt.txs.get(c.txid)?.confirmed && now() - (c.first ?? c.at) > SLOW_CLAIM);
+  return panel('The buyer claimed: claiming your LTC', `<p>The buyer’s claim revealed the secret on Ting in block ${d.claimed.height}. Your page uses it to claim the ${ltc(l.want)} to <code>${esc(t.payout)}</code>${outs.length > 1 ? `, with ${plural(outs.length - 1, 'more output')} the secret opens too` : ''}.</p>
     ${t.ltcClaimError ? `<div class="callout bad">${icon('alert')}<div><b>Litecoin refused the claim:</b> ${esc(t.ltcClaimError)}. The page tries again.</div></div>` : ''}
+    ${slow ? `<div class="callout warn">${icon('clock')}<div><b>Your LTC claim has waited ${span(now() - (slow.first ?? slow.at))} for a Litecoin block.</b> It pays ${int(slow.rate) || 'the'} litoshi per vbyte; if Litecoin’s fees rose since, it can wait a long time. This page cannot speed it up: the claim does not signal replace-by-fee, and has no output of yours to pay more from. It must be in a block before the buyer’s lock ends, ${when(d.accepted.t1)}: after that, the buyer could refund the LTC instead.</div></div>` : ''}
     <dl class="lines mini-lines">${lines}</dl>
     ${waiting(claims.length ? 'Waiting for a Litecoin block: about 2.5 minutes on Litecoin; here, whenever the regtest chain mines.' : 'Building and sending the claim…')}`, 'act');
 }
@@ -1562,6 +1987,7 @@ function offerPanel(d, form) {
   if (BigInt(l.fee) * 1000n > BigInt(l.amount)) {
     return panel('Not a listing to buy', `<div class="callout bad">${icon('alert')}<div>A claim of this listing pays ${dlr(l.fee)} in network fees, out of the ${esc(app.dlr.symbol)} you would get. This page locks only for listings whose fee is at most a thousandth.</div></div>`, 'bad');
   }
+  if (l.window < H.MIN_WINDOW) return shortWindowPanel(l);
   return panel(`Buy these ${dlrPlain(l.amount)} ${esc(app.dlr.symbol)} with ${ltcPlain(l.want)} LTC`, `
     <p>You lock ${ltc(l.want)} on Litecoin; the seller then locks the ${esc(app.dlr.symbol)} for you. If they never accept, you get your LTC back.</p>
     <p class="hint">Your claim pays a network fee of ${dlr(l.fee)}: you receive ${dlr(BigInt(l.amount) - BigInt(l.fee))}.</p>
@@ -1577,6 +2003,18 @@ function offerPanel(d, form) {
       <span class="hint" id="refund-hint">Only needed if the trade does not go through. You can add it later.</span></label></details>
     <div class="row"><button class="primary large" data-make-lock>${icon('lock')} Make my Litecoin lock</button></div>
     ${nextLine('Nothing is sent yet: next you get an address to pay from your own Litecoin wallet.')}`, 'act');
+}
+
+/**
+ * A listing whose window is too short to claim in safely: Ting lets a
+ * block's stamp run 2 hours ahead, and a late claim could be overtaken by the
+ * seller's refund with the secret already public.
+ */
+function shortWindowPanel(l) {
+  return panel('Not a listing to buy', `<div class="callout bad">${icon('alert')}<div>Once accepted, this listing holds the ${esc(app.dlr.symbol)} for only ${span(l.window)}.
+    Ting lets a block’s time run up to 2 hours ahead, so a claim made late in a short window could be overtaken by the
+    seller’s refund, with your secret already public. This page locks only for listings that hold the coins for at
+    least ${span(H.MIN_WINDOW)}.</div></div>`, 'bad');
 }
 
 function buyerPanel(d, t, form) {
@@ -1598,11 +2036,17 @@ function buyerPanel(d, t, form) {
     if (closed) {
       return panel('Your LTC is locked, but the listing closed', `<p>The seller ${d.withdrawn ? 'withdrew the listing' : 'accepted another buyer'} before your page could post your take. Your LTC comes back to you after your lock ends, ${when(t.t1)}.</p>${refundBlock(d, t, form, afterT1)}`, 'bad');
     }
+    if (pay && (t.takeTx?.failed || t.takeLate)) {
+      const why = t.takeTx?.failed ? `Ting refused it: ${esc(t.takeTx.failed)}.` : 'Your payment came too late for the seller to accept it in time.';
+      return panel('Your LTC is locked, but no take was posted', `<p>${ltc(pay.value)} arrived at your lock, but your page could not tell Ting about it. ${why} Nobody can accept it, and the secret stays yours: your LTC comes back to you after your lock ends, ${when(t.t1)}.</p>
+        <dl class="lines mini-lines"><div><dt>Litecoin</dt><dd>${txid(pay.txid)}</dd></div>${t.takeTx ? `<div><dt>Take on Ting</dt><dd>${txid(t.takeTx.id)}</dd></div>` : ''}</dl>
+        ${refundBlock(d, t, form, afterT1)}`, 'bad');
+    }
     if (pay) {
       const confirmed = pay.status.confirmed;
       return panel('Payment seen: posting your take', `<p>${ltc(pay.value)} arrived at your lock (${confirmed ? plural(ltcDepth(pay.status.block_height), 'confirmation') : 'not in a block yet'}). Your page now tells Ting where your lock is: a take, which needs no signature and no fee.</p>
         <dl class="lines mini-lines"><div><dt>Litecoin</dt><dd>${txid(pay.txid)}</dd></div>${t.takeTx ? `<div><dt>Take on Ting</dt><dd>${txid(t.takeTx.id)}</dd></div>` : ''}</dl>
-        ${t.takeTx?.failed ? `<div class="callout bad">${icon('alert')}<div><b>Ting refused the take:</b> ${esc(t.takeTx.failed)}.</div></div>` : waiting('Waiting for the take to be in a Ting block: a few seconds here.')}`, 'wait');
+        ${waiting('Waiting for the take to be in a Ting block: a few seconds here.')}`, 'wait');
     }
     const under = utxos.filter((u) => BigInt(u.value) < BigInt(t.want));
     const uri = `litecoin:${t.address}?amount=${ltcPlain(t.want)}`;
@@ -1618,7 +2062,7 @@ function buyerPanel(d, t, form) {
         </div>
       </div>
       <p><b>Pay it from your own Litecoin wallet</b>, in one payment.${app.ltcWallet ? ` In this test setup that is the <a href="${esc(app.ltcWallet)}" target="_blank" rel="noopener">Litecoin regtest wallet</a>: pick Bob, paste the payment link, send.` : ''}</p>
-      ${under.length ? `<div class="callout bad">${icon('alert')}<div>${ltc(under[0].value)} arrived, less than the ${ltc(t.want)} wanted: the seller cannot accept it. You get it back after ${when(t.t1)}.</div></div>` : ''}
+      ${under.length ? `<div class="callout bad">${icon('alert')}<div>${ltc(under[0].value)} arrived, less than the ${ltc(t.want)} wanted: the seller cannot accept it. You get it back after ${when(t.t1)}.</div></div>${refundBlock(d, t, form, afterT1, { quiet: true })}` : ''}
       ${waiting('Watching Litecoin for your payment. Your page takes it from there.')}
       ${nextLine(`If the seller hasn’t accepted by ${esc(localTime(t.t1 - l.window - H.GAP))}, you take your LTC back.`)}
       <div class="row"><button class="link" data-forget>I changed my mind: forget this lock</button></div>`, 'act');
@@ -1633,6 +2077,9 @@ function buyerPanel(d, t, form) {
   if (ours && d.claimed) {
     const buried = depthOf(d.claimed.height);
     const spent = out?.spent;
+    // Once the seller's claim is in a block, what is still at the lock address is the buyer's: a second payment, or dust.
+    const left = spent && out.spenderConfirmed ? utxos : [];
+    const leftValue = left.reduce((n, u) => n + u.value, 0);
     return panel(buried >= app.tconfs ? `Done: you got ${dlrPlain(d.claimed.paid)} ${esc(app.dlr.symbol)}` : 'Claimed: being buried', `
       <p>${dlr(d.claimed.paid)} went to your account${d.claimed.fee ? `, after a ${dlrText(d.claimed.fee)} ${esc(app.dlr.symbol)} fee` : ''}.</p>
       <details class="owner tech"><summary>Details</summary><dl class="lines mini-lines">${ltcLines}<div><dt>Claim on Ting</dt><dd>${txid(d.claimed.tx)} <span class="muted">${buried >= app.tconfs ? `buried, ${buried} blocks deep` : `${buried} of ${app.tconfs} blocks deep`}</span></dd></div>
@@ -1641,12 +2088,19 @@ function buyerPanel(d, t, form) {
         : nextLine(spent && out.spenderConfirmed ? 'The seller claimed the LTC. The swap is complete.'
           : spent ? 'The seller’s LTC claim is waiting for a Litecoin block; then the swap is complete.'
             : 'The seller’s page now claims the LTC. Your part is done.')}
+      ${left.length ? `<div class="callout">${icon('alert')}<div>${ltc(leftValue)} ${left.length === 1 ? 'is' : 'are'} still at your lock address: a second payment, or an amount someone else sent there. It is yours after your lock ends, ${when(t.t1)}.</div></div>${refundBlock(d, t, form, afterT1, { quiet: true })}` : ''}
       <div class="row">${shareButton(d)}</div>`, buried >= app.tconfs ? 'done' : 'wait');
   }
   if (ours) {
     const deep = depthOf(acc.height);
     if (now() > acc.deadline) {
       return panel('The deadline passed before your claim', `<p>The seller’s accept held the ${esc(app.dlr.symbol)} until ${when(acc.deadline)}. Your secret was never revealed, so the seller cannot take your LTC: it comes back to you after ${when(t.t1)}.</p>${refundBlock(d, t, form, afterT1)}`, 'bad');
+    }
+    if (!t.claimTx && (t.claimTooLate || acc.deadline - now() <= FIRST_CLAIM_BEFORE)) {
+      return panel('Too close to the deadline to claim safely', `<p>The seller’s accept holds the ${esc(app.dlr.symbol)} until ${when(acc.deadline)}, and less than ${span(FIRST_CLAIM_BEFORE)} is left.
+        Ting lets a block’s time run up to 2 hours ahead: a claim now could be overtaken by the seller’s refund, with your
+        secret public, and the seller could then take your LTC too. So your page does not claim. Your secret stays yours,
+        and your LTC comes back to you after your lock ends, ${when(t.t1)}.</p>${refundBlock(d, t, form, afterT1)}`, 'bad');
     }
     const claimLine = t.claimTx ? `<div><dt>Claim on Ting</dt><dd>${txid(t.claimTx.id)}</dd></div>` : '';
     return panel('The seller accepted: claiming your DLR', `
@@ -1661,6 +2115,12 @@ function buyerPanel(d, t, form) {
   if (acc || d.withdrawn) {
     return panel(acc ? 'The seller accepted another buyer' : 'The seller withdrew the listing', `<p>Your lock was not accepted. The seller’s page can release it so that you take your LTC back at once; otherwise it comes back to you after your lock ends, ${when(t.t1)}.</p>
       <dl class="lines mini-lines">${ltcLines}</dl>${refundBlock(d, t, form, afterT1)}`, 'bad');
+  }
+  // The lock as the seller's page checks it: one it cannot accept is said so, with the way back.
+  const check = checkTake(l, take);
+  if (check.state === 'bad') {
+    return panel('The seller cannot accept your lock', `<div class="callout bad">${icon('alert')}<div>${esc(check.words.replace(/^./, (ch) => ch.toUpperCase()))}. Your LTC comes back to you after your lock ends, ${when(t.t1)}.</div></div>
+      <details class="owner tech"><summary>Details</summary><dl class="lines mini-lines">${ltcLines}</dl></details>${refundBlock(d, t, form, afterT1)}`, 'bad');
   }
   const confsLeft = Math.max(0, app.confs - depth);
   return panel('Your LTC is locked: over to the seller', `
@@ -1678,7 +2138,8 @@ function releasedPanel(d, t, take, released, form) {
   if (t.releaseTx) {
     const s = app.lt.txs.get(t.releaseTx.txid);
     return panel(s?.confirmed ? 'Your LTC is back' : 'Taking your LTC back', `<p>${s?.confirmed ? 'Done:' : 'Sent:'} ${ltc(t.releaseTx.value)}${usd(t.releaseTx.value)} to <code>${esc(t.releaseTx.to)}</code>.</p>
-      <dl class="lines mini-lines"><div><dt>Release on Litecoin</dt><dd>${txid(t.releaseTx.txid)} <span class="muted">${s?.confirmed ? plural(ltcDepth(s.height), 'confirmation') : 'waiting for a block'}</span></dd></div></dl>
+      <dl class="lines mini-lines"><div><dt>Release on Litecoin</dt><dd>${txid(t.releaseTx.txid)} <span class="muted">${s?.confirmed ? plural(ltcDepth(s.height), 'confirmation') : s && !s.found ? 'not seen by the explorer: your page sends it again' : 'waiting for a block'}</span></dd></div></dl>
+      ${t.releaseTx.error && !s?.found ? `<div class="callout bad">${icon('alert')}<div><b>Litecoin did not take it again:</b> ${esc(t.releaseTx.error)}.</div></div>${refundBlock(d, t, form, app.lt.tip?.mtp > t.t1)}` : ''}
       ${s?.confirmed ? '' : waiting('Waiting for a Litecoin block.')}`, s?.confirmed ? 'done' : 'wait');
   }
   if (out?.spent) {
@@ -1689,7 +2150,8 @@ function releasedPanel(d, t, take, released, form) {
   return panel(`${why}: take your LTC back now`, `<p>The seller’s page released your lock in block ${released.height}: its signature lets your LTC go back to you at once, without waiting for ${esc(localTime(t.t1))}.</p>
     ${addressField(t, form)}
     <div class="row"><button class="primary large" data-take-back>${icon('undo')} Take my LTC back now</button></div>
-    ${nextLine('Your page signs the other half and sends it to Litecoin. It is final after one Litecoin block.')}`, 'act');
+    ${nextLine('Your page signs the other half and sends it to Litecoin. It is final after one Litecoin block.')}
+    ${refundBlock(d, t, form, app.lt.tip?.mtp > t.t1, { quiet: true, field: false })}`, 'act');
 }
 
 function addressField(t, form) {
@@ -1698,17 +2160,24 @@ function addressField(t, form) {
     <span class="hint">Where your LTC goes back to.</span></label>`;
 }
 
-/** The buyer's way back after T1: a refund of every output at the lock address. */
-function refundBlock(d, t, form, afterT1, { quiet = false } = {}) {
-  const done = Object.values(t.refundTxs ?? {});
-  if (done.length) {
-    return `<dl class="lines mini-lines">${done.map((r) => {
-      const s = app.lt.txs.get(r.txid);
-      return `<div><dt>Refund on Litecoin</dt><dd>${txid(r.txid)} <span class="muted">${s?.confirmed ? plural(ltcDepth(s.height), 'confirmation') : 'waiting for a block'}</span></dd></div>`;
-    }).join('')}</dl>`;
-  }
-  if (!afterT1) return quiet ? '' : nextLine(`After ${esc(localTime(t.t1))} (Litecoin goes by the median time of its last 11 blocks), a “Refund my LTC” button appears here.`);
-  return `${addressField(t, form)}<div class="row"><button class="primary" data-refund-ltc>${icon('undo')} Refund my LTC</button></div>`;
+/**
+ * The buyer's way back after T1: the refunds sent, with where each stands,
+ * and while outputs in a block are left at the lock address, a button that
+ * refunds them all in one transaction once T1 has passed by Litecoin's
+ * median time; before that, when that is.
+ */
+function refundBlock(d, t, form, afterT1, { quiet = false, field = true } = {}) {
+  const sent = Object.values(t.refundTxs ?? {});
+  const lines = sent.length ? `<dl class="lines mini-lines">${sent.map((r) => {
+    const s = app.lt.txs.get(r.txid);
+    const where = s?.confirmed ? plural(ltcDepth(s.height), 'confirmation') : s && !s.found ? 'not seen by the explorer: your page sends it again' : 'waiting for a block';
+    return `<div><dt>Refund on Litecoin</dt><dd>${txid(r.txid)} <span class="muted">${ltcText(r.value)} LTC · ${where}</span></dd></div>`;
+  }).join('')}</dl>` : '';
+  const known = app.lt.utxos.has(t.address);
+  const left = (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed);
+  if (known && !left.length) return lines;
+  if (!afterT1) return lines + (quiet ? '' : nextLine(`After ${esc(localTime(t.t1))} (Litecoin goes by the median time of its last 11 blocks), a “Refund my LTC” button appears here.`));
+  return `${lines}${field ? addressField(t, form) : ''}<div class="row"><button class="primary" data-refund-ltc>${icon('undo')} Refund my LTC</button></div>`;
 }
 
 function watchPanel(d) {
@@ -1725,7 +2194,7 @@ function watchPanel(d) {
 
 function timelineCard(d) {
   const acc = d.accepted;
-  const accTake = acc ? d.takes.find((x) => matchesAccept(x, acc)) : null;
+  const accTake = acceptedTake(d);
   const accOut = accTake?.lockOf ? outOf(accTake.lockOf.txid, accTake.lockOf.vout) : null;
   const ended = d.withdrawn || d.refunded;
   const liveTakes = d.takes.filter((x) => !releaseOf(d, x));
@@ -1894,10 +2363,11 @@ async function makeLock(id, form) {
   if (!l || d.accepted) throw new Error('The listing was just accepted or withdrawn: there is nothing to lock for.');
   if (!forThisPage(l)) throw new Error('This listing’s Litecoin key is not one the page can lock to.');
   if (BigInt(l.fee) * 1000n > BigInt(l.amount)) throw new Error('This listing’s claim pays more than a thousandth of its coins in fees: the page does not lock for it.');
+  if (l.window < H.MIN_WINDOW) throw new Error(`This listing holds the coins for only ${span(l.window)} once accepted: too short to claim safely. The page locks only for ${span(H.MIN_WINDOW)} or more.`);
   if (!H.isZero(l.taker) && !equal(l.taker, receive)) throw new Error(`This listing is for ${short(l.taker)} only: the program would refuse your take.`);
   if (d.seller) throw new Error('This is your own listing.');
   await ensureSeed();
-  const n = K.takeCounter();
+  const n = await freshCounter();
   const m = marksOf(n);
   const t1 = now() + l.window + H.GAP + ACCEPT_TIME;
   const htlc = { tag: L.lockTag(app.program, id, receive), hash: m.hash, seller: l.key, buyer: m.pub, t1 };
@@ -1907,21 +2377,34 @@ async function makeLock(id, form) {
     t1, address, want: String(l.want), amount: String(l.amount),
   });
   toast('Your lock is ready. Pay it from your own Litecoin wallet.', 'success', 5000);
-  await refreshTrade(id);
-  app.onData?.();
+  await read();
 }
 
+/** Whether this browser released, or sent a release of, the lock a take names. */
+function releasedHere(d, take) {
+  return Boolean(take.lockOf && d.seller?.releases?.[outKey(take.lockOf)]) || Boolean(releaseOf(d, take));
+}
+
+/**
+ * The seller's accept, through Ting ID: refused for a lock this browser
+ * released or sent a release of, and for one that does not pass the check,
+ * read again from Litecoin now. The page notes which lock the link is for
+ * before showing it: while the listing is open, it never releases that lock,
+ * since the link can still be approved.
+ */
 async function accept(id, index) {
   const listing = H.decodeListing(id, await app.node.record(app.program, H.listingKey(id)));
   if (!listing) throw new Error('The listing is no longer open.');
   const d = tradeOf(id);
   const take = d.takes[index];
+  if (!d.seller) throw new Error('This browser did not make this listing.');
   if (!take || !take.lockOf) throw new Error('That lock is gone.');
-  if (releaseOf(d, take)) throw new Error('You released this lock: the buyer may have taken the LTC back. Not accepting it.');
+  if (releasedHere(d, take)) throw new Error('You released this lock: the buyer can take the LTC back with it. Not accepting it.');
   await refreshLtc({ outs: [[take.lockOf.txid, take.lockOf.vout]] });
-  if (app.lt.error) throw new Error(`Cannot check the lock on Litecoin: ${app.lt.error}`);
+  if (app.lt.error || app.lt.failed.has(outKey(take.lockOf))) throw new Error(`Cannot check the lock on Litecoin: ${app.lt.error ?? app.lt.failed.get(outKey(take.lockOf))}`);
   const c = checkTake(listing, take);
   if (c.state !== 'ok') throw new Error(`Not accepting: ${c.words}.`);
+  update(d.seller, { accepting: { ...(d.seller.accepting ?? {}), [outKey(take.lockOf)]: { at: now(), index } } });
   await perform({
     call: H.acceptCall(listing, take), feeCoin: app.coin, label: `Accept the lock for listing #${id}`,
     notes: `<p class="hint">Checked on Litecoin just now: ${esc(c.words)}. Ting ID shows the buyer’s account and the hash shortened, and the time their lock ends.</p>`,
@@ -1931,12 +2414,19 @@ async function accept(id, index) {
 
 /**
  * Signs and posts the release of one lock the seller does not accept: a
- * signature that lets its buyer take the LTC back at once. Returns the Ting
- * transaction's id, or throws saying why there is nothing to release.
+ * signature that lets its buyer take the LTC back at once. Refused for the
+ * accepted lock, and, while the listing is open, for a lock this browser made
+ * an accept link for: with that link approved too, the buyer would have both
+ * sides. Returns the Ting transaction's id, or throws saying why not.
  */
 async function sendRelease(d, take) {
+  if (!d.seller) throw new Error('This browser did not make this listing.');
   if (matchesAccept(take, d.accepted)) throw new Error('This is the lock you accepted: releasing it would give the buyer both sides. Not releasing.');
   const lock = lockScript(d.terms, take);
+  if (!lock) throw new Error('That take names no lock this page can read: there is nothing to release.');
+  if (d.open && d.seller.accepting?.[outKey(lock)]) {
+    throw new Error('You opened an accept link for this lock, and while the listing is open it can still be approved: with a release too, the buyer would have both sides. Withdraw the listing first; your page then releases this lock by itself.');
+  }
   await refreshLtc({ outs: [[lock.txid, lock.vout]] });
   const out = outOf(lock.txid, lock.vout);
   if (!out || out.missing || out.script !== hex(lock.scriptPubKey)) throw new Error('There is no such lock on Litecoin to release.');
@@ -1944,7 +2434,7 @@ async function sendRelease(d, take) {
   const key = K.keyAt(K.seed(), d.seller.n);
   const signature = L.releaseSignature({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, key });
   const tx = await sendOwn(H.releaseInput(d.id, L.encodeRelease({ txid: lock.txid, vout: lock.vout, signature })));
-  update(d.seller, { releases: { ...(d.seller.releases ?? {}), [`${lock.txid}:${lock.vout}`]: tx } });
+  update(d.seller, { releases: { ...(d.seller.releases ?? {}), [outKey(lock)]: { id: tx, at: now() } } });
   return tx;
 }
 
@@ -1960,17 +2450,26 @@ async function release(id, index) {
 /**
  * Releases, by itself, every lock of an accepted or withdrawn listing but the
  * accepted one: those that are on Litecoin, unspent, and not released yet,
- * from this browser or on Ting. It does not wait for the releases to be in a
- * block; the trade view shows them as they arrive.
+ * from this browser or on Ting; never, while the listing is open, one this
+ * browser made an accept link for. It does not wait for the releases to be in
+ * a block; the trade view shows them as they arrive.
  */
 async function releaseOthers(d, t) {
   for (const take of d.takes) {
     if (matchesAccept(take, d.accepted) || releaseOf(d, take)) continue;
     const c = checkTake(d.terms, take);
     if (!c.lock || !c.out || c.out.missing || c.out.spent || c.out.script !== hex(c.lock.scriptPubKey)) continue;
-    const key = `${c.lock.txid}:${c.lock.vout}`;
-    if (t.releases?.[key]) continue;
-    await once(`release:${key}`, () => sendRelease(d, take).catch((e) => update(t, { releaseError: e.message })));
+    const key = outKey(c.lock);
+    if (d.open && t.accepting?.[key]) continue;
+    const sent = t.releases?.[key];
+    if (sent) {
+      // A release sent: sent again only once the node no longer knows it (the same signature, so the same transaction).
+      const id = typeof sent === 'string' ? sent : sent.id;
+      if (typeof sent !== 'string' && now() - sent.at < RESEND_AFTER) continue;
+      const s = await tingTx(id).catch(() => null);
+      if (s?.state !== 'missing') continue;
+    }
+    await once(`release:${key}`, () => sendRelease(d, take).then(() => update(t, { releaseError: null })).catch((e) => update(t, { releaseError: e.message })));
   }
 }
 
@@ -1980,7 +2479,7 @@ async function withdraw(id) {
   if (!listing) throw new Error('The listing is no longer open: it was accepted or withdrawn.');
   await perform({
     call: H.withdrawCall(listing), from: listing.maker, feeCoin: app.coin, label: `Withdraw listing #${id}`,
-    notes: d.takes.length ? '<p class="hint">Buyers who locked LTC for it can still be released afterwards.</p>' : '',
+    notes: d.takes.length ? '<p class="hint">Once it is withdrawn, your page releases the buyers’ locks by itself, so they take their LTC back at once.</p>' : '',
     done: () => app.onData?.(),
   });
 }
@@ -2002,51 +2501,60 @@ function refundAddress(t, form) {
   return to;
 }
 
-/** The buyer's release: the seller's signature and the buyer's own, sent to Litecoin. */
+/**
+ * The buyer's release: the seller's signature, the first released event for
+ * this lock that verifies, and the buyer's own, sent to Litecoin. The page
+ * keeps it once Litecoin took it, and sends it again while the explorer does
+ * not know it.
+ */
 async function takeBack(id, form) {
   const d = tradeOf(id);
   const t = d.buyer;
-  const take = takeOfBuyer(d, t);
-  const released = take && releaseOf(d, take);
-  if (!released) throw new Error('The seller has not released this lock.');
+  const take = t && takeOfBuyer(d, t);
+  const lock = take && lockScript(d.terms, take);
+  if (!lock) throw new Error('Your lock is not on Ting: there is nothing to take back with a release.');
   const to = refundAddress(t, form);
-  const lock = lockScript(d.terms, take);
   await refreshLtc({ outs: [[lock.txid, lock.vout]] });
   const out = outOf(lock.txid, lock.vout);
   if (!out || out.missing || out.spent) throw new Error('The lock is not there to take back.');
+  const released = releaseOf(tradeOf(id), take);
+  if (!released) throw new Error('The seller has not released this lock: no release on Ting checks out.');
   const tx = L.releaseTx({
     txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, key: K.keyAt(K.seed(), t.n),
     signature: released.release.signature, to, feeRate: await feeRate(), network: app.net,
   });
-  update(t, { releaseTx: { txid: tx.txid, hex: tx.hex, value: out.value - tx.fee, to, at: now() } });
   await broadcast(tx.hex);
+  update(t, { releaseTx: { txid: tx.txid, hex: tx.hex, value: out.value - tx.fee, to, at: now() } });
   toast('Sent: your LTC is on its way back.', 'success', 6000);
-  await refreshTrade(id);
-  app.onData?.();
+  await read();
 }
 
-/** The buyer's refund after T1: every output at the lock address, each in its own transaction. */
+/**
+ * The buyer's refund after T1: every output in a block at the lock address,
+ * in one transaction, an output worth less than its share of the fee left
+ * out. The page keeps it once Litecoin took it, and sends it again while the
+ * explorer does not know it.
+ */
 async function refundLtc(id, form) {
   const d = tradeOf(id);
   const t = d.buyer;
   const to = refundAddress(t, form);
   await refreshLtc({ addresses: [t.address] });
+  if (app.lt.error || app.lt.failed.has(t.address)) throw new Error(`Cannot read your lock address on Litecoin: ${app.lt.error ?? app.lt.failed.get(t.address)}`);
   if (!(app.lt.tip?.mtp > t.t1)) throw new Error(`Not yet: Litecoin’s median time has not passed ${localTime(t.t1)}.`);
-  const utxos = app.lt.utxos.get(t.address) ?? [];
-  if (!utxos.length) throw new Error('Nothing is left at your lock address.');
+  const utxos = (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed);
+  if (!utxos.length) throw new Error('Nothing in a block is left at your lock address.');
   const m = marksOf(t.n);
   const htlc = { tag: L.lockTag(app.program, id, unhex(t.receive)), hash: m.hash, seller: d.terms.key, buyer: m.pub, t1: t.t1 };
   if (L.lockOutput(htlc, app.net).address !== t.address) throw new Error('The lock rebuilt from this trade is not the address you paid: not refunding.');
-  const refunds = { ...(t.refundTxs ?? {}) };
-  for (const u of utxos) {
-    const tx = L.refundTx({ txid: u.txid, vout: u.vout, value: u.value, htlc, key: K.keyAt(K.seed(), t.n), to, feeRate: await feeRate(), network: app.net });
-    refunds[`${u.txid}:${u.vout}`] = { txid: tx.txid, hex: tx.hex, value: u.value - tx.fee, at: now() };
-    update(t, { refundTxs: refunds });
-    await broadcast(tx.hex);
-  }
-  toast('Refund sent: your LTC is on its way back.', 'success', 6000);
-  await refreshTrade(id);
-  app.onData?.();
+  const tx = L.refundAllTx({
+    inputs: utxos.map((u) => ({ txid: u.txid, vout: u.vout, value: u.value, htlc })),
+    key: K.keyAt(K.seed(), t.n), to, feeRate: await feeRate(), network: app.net,
+  });
+  await broadcast(tx.hex);
+  update(t, { refundTxs: { ...(t.refundTxs ?? {}), [tx.txid]: { txid: tx.txid, hex: tx.hex, value: tx.value, covers: tx.spent.map(outKey), at: now() } } });
+  toast(`Refund sent: ${ltcPlain(tx.value)} LTC is on its way back.`, 'success', 6000);
+  await read();
 }
 
 async function savePayout(id, form) {
@@ -2193,38 +2701,73 @@ function renderBackup(main) {
 }
 
 /**
- * Finds the trades of a seed again: counter by counter, listed events with
- * its key and taken events with its secret's hash, until GAP_LIMIT counters in
- * a row find nothing. Then makes it this browser's seed.
+ * Finds the trades of a seed again: counter by counter, the listed events with
+ * its key and the taken events with its secret's hash, until GAP_LIMIT
+ * counters in a row find nothing. Then makes it this browser's seed.
+ *
+ * Keys and hashes are public once on chain, and anyone can list again with a
+ * key or post a take again with a hash. A listing's first event with its key
+ * came before anyone could copy it: that one is the trade's, with its maker.
+ * Of the takes with the hash and this seed's key, the trade's is the earliest
+ * whose rebuilt lock address Litecoin has seen paid; a copy with another
+ * account, T1 or listing points at an address nobody paid.
  */
 async function restore(seedBytes) {
   if (!K.canStore()) throw new Error('This browser does not let the page keep keys.');
   await refreshTing();
-  const listed = app.events.filter((e) => e.kind === 'listed');
+  if (app.tingError) throw new Error(`Cannot read Ting: ${app.tingError}`);
+  const listed = app.events.filter((e) => e.kind === 'listed').sort((a, b) => a.id - b.id);
   const taken = app.events.filter((e) => e.kind === 'taken');
+  const termsOf = (id) => app.listings.get(id) ?? listed.find((e) => e.id === id);
   const found = [];
   let miss = 0;
   let last = -1;
   for (let n = 0; miss < K.GAP_LIMIT && n < 100_000; n++) {
     const m = K.marksAt(seedBytes, n);
     if (!m) continue;
-    let hit = false;
-    for (const e of listed) {
-      if (!equal(e.key, m.pub)) continue;
-      found.push({ n, role: 'seller', listing: e.id, created: e.time * 1000, payout: null, amount: String(e.amount), want: String(e.want), window: e.window, fee: String(e.fee), restored: true });
-      hit = true;
+    const own = listed.find((e) => equal(e.key, m.pub));
+    if (own) {
+      found.push({
+        n, role: 'seller', listing: own.id, maker: hex(own.maker), listedTx: own.tx, created: own.time * 1000, payout: null,
+        amount: String(own.amount), want: String(own.want), window: own.window, fee: String(own.fee), restored: true,
+      });
     }
-    const take = taken.filter((e) => equal(e.hash, m.hash)).at(-1);
-    if (take) {
-      const terms = app.listings.get(take.id) ?? listed.find((e) => e.id === take.id);
-      const lock = lockOfTake(take);
-      if (terms && lock) {
-        const htlc = { tag: L.lockTag(app.program, take.id, take.taker), hash: m.hash, seller: terms.key, buyer: m.pub, t1: take.t1 };
-        found.push({ n, role: 'buyer', listing: take.id, created: take.time * 1000, receive: hex(take.taker), refundTo: null, t1: take.t1, address: L.lockOutput(htlc, app.net).address, want: String(terms.want), amount: String(terms.amount), restored: true });
-        hit = true;
+    const takes = taken.filter((e) => equal(e.hash, m.hash));
+    const candidates = takes.map((e) => {
+      const lock = lockOfTake(e);
+      const terms = termsOf(e.id);
+      if (!lock || !equal(lock.buyer, m.pub) || !terms || !forThisPage(terms)) return null;
+      try {
+        const htlc = { tag: L.lockTag(app.program, e.id, e.taker), hash: m.hash, seller: terms.key, buyer: m.pub, t1: e.t1 };
+        return { e, lock, terms, address: L.lockOutput(htlc, app.net).address };
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+    let chosen = null;
+    for (const c of candidates.slice(0, 5)) {
+      try {
+        const txs = await app.ltc.addressTxs(c.address);
+        if (Array.isArray(txs) && txs.length) {
+          chosen = c;
+          break;
+        }
+      } catch {
+        // The explorer cannot say: the earliest, marked as not checked.
+        chosen = { ...candidates[0], unchecked: true };
+        break;
       }
     }
-    if (hit) {
+    chosen ??= candidates[0] ? { ...candidates[0], unchecked: true } : null;
+    if (chosen) {
+      const { e, lock, terms, address } = chosen;
+      found.push({
+        n, role: 'buyer', listing: e.id, created: e.time * 1000, receive: hex(e.taker), refundTo: null, t1: e.t1, address,
+        want: String(terms.want), amount: String(terms.amount), take: { txid: lock.txid, vout: lock.vout, tx: e.tx, height: e.height },
+        restored: true, unchecked: Boolean(chosen.unchecked),
+      });
+    }
+    if (own || takes.length) {
       last = n;
       miss = 0;
     } else {
@@ -2237,7 +2780,7 @@ async function restore(seedBytes) {
   K.restoreSeed(seedBytes, Math.max(last + 1, same ? K.nextCounter() : 0));
   marks.clear();
   const kept = K.trades(app.program);
-  for (const t of found) if (!kept.some((x) => x.n === t.n && x.listing === t.listing)) K.saveTrade(app.program, t);
+  for (const t of found) if (!kept.some((x) => x.n === t.n)) K.saveTrade(app.program, t);
   return found;
 }
 
@@ -2287,17 +2830,16 @@ function fatal(title, detail) {
   $('#view').innerHTML = `<section class="notice"><h1>${esc(title)}</h1><p>${detail}</p></section>`;
 }
 
-let reading = false;
+let running = null;
 
-/** Reads what the current view follows, and draws it again when something changed. */
+/**
+ * Runs a round of reading and acting, after the one under way if there is
+ * one, so that a caller sees what it did itself; then draws the view again.
+ */
 async function read() {
-  if (reading) return;
-  reading = true;
-  try {
-    await app.reader?.();
-  } finally {
-    reading = false;
-  }
+  while (running) await running;
+  running = round().catch(() => {}).finally(() => { running = null; });
+  await running;
   app.onData?.();
 }
 
@@ -2314,7 +2856,12 @@ async function boot() {
   if (!LTC_NETS.includes(app.net)) {
     return fatal('Test networks only', `This page is a test setup: it runs on Litecoin regtest or testnet, never on <code>${esc(app.net || 'mainnet')}</code>. Add <code>ltcnet=regtest</code> or <code>ltcnet=testnet</code> to the address.`);
   }
-  app.node = new Node(nodeBase);
+  // The node, the explorer, the wallet and the price source over https, or http on this computer only.
+  const insecure = ['node', 'ltc', 'wallet', 'price'].filter((name) => query.get(name) && query.get(name) !== 'off' && !safeUrl(query.get(name)));
+  if (insecure.length) {
+    return fatal('Only https addresses', `The page talks to its node, explorer, wallet and price source over https, or plain http on this computer only. Not: <code>${esc(insecure.join(', '))}</code>.`);
+  }
+  app.node = new Node(safeUrl(nodeBase));
   let status;
   try {
     status = await app.node.status();
@@ -2325,21 +2872,21 @@ async function boot() {
     return fatal('Ting development chain only', `This page is a test setup and runs only on the Ting development chain. The node at <code>${esc(app.node.base)}</code> is on chain <code>${esc(status.chain_id)}</code>.`);
   }
   app.chainHex = status.chain_id;
-  app.tip = { height: status.height, time: now() };
+  app.tip = { height: int(status.height), time: now() };
   app.program = idOf(query.get('htlc'));
   app.coin = idOf((query.get('coins') ?? '').split(',')[0]);
   if (!app.program || !app.coin) return fatal('The address is missing an id', 'It needs <code>htlc</code>, the program’s ContractId, and <code>coins</code>, the DLR coin’s.');
   app.vault = contractAccount(app.program);
-  app.wallet = query.get('wallet') ?? '';
-  app.ltc = new Esplora(query.get('ltc'));
+  app.wallet = query.get('wallet') ? safeUrl(query.get('wallet')) : '';
+  app.ltc = new Esplora(safeUrl(query.get('ltc')));
   app.ltcWallet = app.net === 'regtest' ? new URL('/', app.ltc.base).href : '';
-  const int = (name, fallback, min, max) => {
+  const param = (name, fallback, min, max) => {
     const v = Number(query.get(name));
     return query.get(name) != null && Number.isInteger(v) && v >= min && v <= max ? v : fallback;
   };
-  app.confs = int('confs', 1, 0, 100);
-  app.tconfs = int('tconfs', 3, 1, 100);
-  app.ltcFee = int('ltcfee', null, 1, 1000);
+  app.confs = param('confs', 1, 0, 100);
+  app.tconfs = param('tconfs', TCONFS, 1, 1000);
+  app.ltcFee = param('ltcfee', null, 1, MAX_FEE_RATE);
   try {
     const program = await app.node.contract(app.program);
     if (program.code_hash !== HTLC_CODE) {
@@ -2376,16 +2923,17 @@ async function boot() {
   readClaimRate();
   setInterval(readClaimRate, PRICE_EVERY);
   setInterval(() => app.tick?.(), 1000);
+  // Every few seconds, whatever the view: each open trade's automatic steps run from here.
   let last = 0;
   setInterval(() => {
-    if (Date.now() - last < (app.readEvery ?? MARKET_POLL)) return;
+    if (running || Date.now() - last < (app.readEvery ?? MARKET_POLL)) return;
     last = Date.now();
     read().catch(() => {});
   }, 1000);
   window.addEventListener('hashchange', arrive);
   await refreshTing();
   arrive();
-  read(true).catch(() => {});
+  read().catch(() => {});
 }
 
 /** Routes, or takes a call back from Ting ID: the link's `return` opened with `#ting-tx=`. */
@@ -2395,17 +2943,24 @@ function arrive() {
   history.replaceState(null, '', location.pathname + location.search);
   route();
   (async () => {
-    const s = await followTing(m[1].toLowerCase(), 'Your call from Ting ID');
+    const tx = m[1].toLowerCase();
+    const s = await followTing(tx, 'Your call from Ting ID');
     if (s.state !== 'done') return;
-    findMyListings();
-    const answer = await app.node.transaction(m[1].toLowerCase()).catch(() => null);
+    const answer = await app.node.transaction(tx).catch(() => null);
+    let listing = null;
     for (const e of answer?.occurrences?.[0]?.receipt?.events ?? []) {
       if (e.contract !== hex(app.program)) continue;
-      const payload = unhex(e.payload_hex);
-      if (payload.length < 41 || !equal(payload.subarray(0, 32), H.TOPIC)) continue;
-      location.hash = `#/l/${Number(new Reader(payload.subarray(33, 41)).u64())}`;
-      return;
+      try {
+        const r = new Reader(unhex(e.payload_hex));
+        if (!equal(r.take(32), H.TOPIC)) continue;
+        const event = H.decodeEvent(r);
+        listing ??= event.id;
+        // A listing this browser offered: it is this transaction's, made by its maker.
+        if (event.kind === 'listed') pinListing(event.key, tx, event.maker);
+      } catch { /* not an event this page reads */ }
     }
+    findMyListings();
+    if (listing != null) location.hash = `#/l/${listing}`;
   })().catch(() => {});
 }
 

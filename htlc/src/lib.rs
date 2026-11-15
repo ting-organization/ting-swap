@@ -117,8 +117,14 @@ fn check_coin(coin: &[u8; 32]) {
 /// chain, `t1`: a maker who sees the secret appear here at the last moment
 /// still has this long to claim there.
 const GAP: u64 = 21_600;
-/// The least and the most a listing may hold its coins once accepted.
-const MIN_WINDOW: u64 = 3_600;
+/// The least and the most a listing may hold its coins once accepted. Claims
+/// and refunds go by the block timestamp, and Ting's nodes admit a block
+/// stamped up to 2 hours ahead of their clocks: a seller who mines could put a
+/// refund in a block stamped just past the deadline, leave out the buyer's
+/// pending claim, keep the coins and claim the other chain's with the secret
+/// the claim made public. The least window, 6 hours, is comfortably above that
+/// clock slack plus the time a claim needs to get into a block.
+const MIN_WINDOW: u64 = 21_600;
 const MAX_WINDOW: u64 = 604_800;
 
 /// An offer's fee is at most a `FEE_SHARE`th of the coins it pays in. The fee

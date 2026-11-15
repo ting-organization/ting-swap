@@ -730,6 +730,104 @@ export function refundTx({ key, ...lock }) {
   return finish(spent);
 }
 
+// ---- Sweeping several locks at once -----------------------------------------
+
+/** The bytes a witness adds to a transaction: its item count, then each item with its length. */
+const witnessSize = (items) => items.reduce((n, item) => n + compactSize(item.length).length + item.length, compactSize(items.length).length);
+
+/** What one input adds to a transaction's vsize: its outpoint, empty scriptSig and nSequence, 41 bytes at 4 weight each, and its witness at 1. */
+const inputVsize = (witness) => (4 * 41 + witnessSize(witness)) / 4;
+
+/**
+ * A transaction spending several lock outputs into one output to `to`: each
+ * of `inputs` is `{ txid, vout, value, htlc }`, its own lock, and gets the
+ * witness `stack(signature)` gives, then its script. Its fee is `feeRate` per
+ * vbyte of its size with the longest signatures. An input worth no more than
+ * what it adds to that fee would only cost, as dust does: it is left out, and
+ * listed in `skipped`. Throws when nothing is left to pay out.
+ */
+function spendAll(inputs, { to, feeRate, network = 'mainnet' }, { sequence, locktime, stack }) {
+  if (!Array.isArray(inputs) || !inputs.length) throw new Error('no lock to spend');
+  const out = destination(to, network);
+  const rate = typeof feeRate === 'bigint' ? Number(feeRate) : feeRate;
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < MIN_FEE_RATE) {
+    throw new Error(`a fee rate of ${feeRate} litoshi per vbyte: Litecoin relays from ${MIN_FEE_RATE}`);
+  }
+  const seen = new Set();
+  const kept = [];
+  const skipped = [];
+  for (const lock of inputs) {
+    const script = htlcScript(lock.htlc);
+    const input = { txid: hex(txidBytes(lock.txid)), vout: checkVout(lock.vout), scriptSig: EMPTY, sequence, witness: [...stack(LONGEST), script] };
+    const at = `${input.txid}:${input.vout}`;
+    if (seen.has(at)) throw new Error(`the output ${at} is named twice`);
+    seen.add(at);
+    const amount = checkAmount(lock.value);
+    const item = { input, script, amount, lock: { txid: input.txid, vout: input.vout, value: amount } };
+    (amount > Math.ceil(inputVsize(input.witness) * rate) ? kept : skipped).push(item);
+  }
+  if (!kept.length) throw new Error('every output is worth less than the fee to spend it');
+  const total = kept.reduce((n, k) => n + k.amount, 0);
+  if (total > MAX_MONEY) throw new Error('more than all the litoshi there are');
+  const tx = { version: 2, inputs: kept.map((k) => k.input), outputs: [{ value: 0, script: out }], locktime };
+  const fee = Math.ceil(vsize(tx) * rate);
+  if (fee >= total) throw new Error(`a fee of ${fee} litoshi takes the whole ${total}`);
+  const dust = dustLimit(out);
+  if (total - fee < dust) {
+    throw new Error(`after a fee of ${fee} litoshi, ${total - fee} would be left: below Litecoin's dust limit of ${dust} for this output`);
+  }
+  tx.outputs[0].value = total - fee;
+  return { tx, kept, skipped, fee, total };
+}
+
+const finishAll = ({ tx, kept, skipped, fee, total }) => ({
+  hex: hex(serializeTx(tx)), txid: txid(tx), fee, vsize: vsize(tx), tx, value: total - fee,
+  spent: kept.map((k) => k.lock), skipped: skipped.map((k) => k.lock),
+});
+
+/**
+ * The seller's claim of several locks with one secret, in one transaction:
+ * each input as `claimTx` spends one, `sig(seller) ‖ secret ‖ 01 ‖ script`,
+ * SIGHASH_ALL, nLockTime 0 and final nSequences. Takes `{ inputs, secret,
+ * key, to, feeRate, network }`, each input `{ txid, vout, value, htlc }` with
+ * the secret's hash and the seller's key; gives `{ hex, txid, fee, vsize, tx,
+ * value, spent, skipped }`. With one input it is `claimTx`'s transaction.
+ */
+export function claimAllTx({ inputs, secret, key, ...options }) {
+  checkBytes(secret, 32, 'the secret');
+  for (const lock of inputs ?? []) {
+    htlcScript(lock.htlc);
+    checkSigner(key, lock.htlc.seller, 'seller');
+    if (!equal(sha256(secret), lock.htlc.hash)) throw new Error("the secret does not hash to a lock's hash");
+  }
+  const spent = spendAll(inputs, options, { sequence: FINAL, locktime: 0, stack: (sig) => [sig, secret, Uint8Array.of(1)] });
+  spent.kept.forEach((k, i) => {
+    spent.tx.inputs[i].witness[0] = signed(key, sighash(spent.tx, i, k.script, k.amount, SIGHASH_ALL), SIGHASH_ALL);
+  });
+  return finishAll(spent);
+}
+
+/**
+ * The buyer's refund of several locks after their T1s, in one transaction:
+ * each input as `refundTx` spends one, `sig(buyer) ‖ 01 ‖ (empty) ‖ script`,
+ * SIGHASH_ALL, nSequence 0xfffffffe, and nLockTime the latest T1. Takes
+ * `{ inputs, key, to, feeRate, network }`, each input `{ txid, vout, value,
+ * htlc }` with the buyer's key; gives what `claimAllTx` gives.
+ */
+export function refundAllTx({ inputs, key, ...options }) {
+  let locktime = 0;
+  for (const lock of inputs ?? []) {
+    htlcScript(lock.htlc);
+    checkSigner(key, lock.htlc.buyer, 'buyer');
+    locktime = Math.max(locktime, checkT1(lock.htlc.t1));
+  }
+  const spent = spendAll(inputs, options, { sequence: 0xfffffffe, locktime, stack: (sig) => [sig, Uint8Array.of(1), EMPTY] });
+  spent.kept.forEach((k, i) => {
+    spent.tx.inputs[i].witness[0] = signed(key, sighash(spent.tx, i, k.script, k.amount, SIGHASH_ALL), SIGHASH_ALL);
+  });
+  return finishAll(spent);
+}
+
 /** The digest a release's seller signature signs: version 2, nLockTime 0, nSequence 0xffffffff, NONE|ANYONECANPAY. */
 function releaseDigest({ txid, vout, value, htlc }) {
   const script = htlcScript(htlc);

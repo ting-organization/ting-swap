@@ -53,10 +53,11 @@ export function twoDigits(v) {
  * no payout account.
  */
 export async function claimFee(node, coin) {
-  const cache = load();
-  const hit = cache[coin];
-  if (hit && Date.now() - hit.at < KEEP_MS) return BigInt(hit.fee);
   const coinHex = typeof coin === 'string' ? coin : [...coin].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const cache = load();
+  // Kept by the coin's ContractId in hex, as it is stored below.
+  const hit = cache[coinHex];
+  if (hit && Date.now() - hit.at < KEEP_MS && /^\d+$/.test(String(hit.fee))) return BigInt(hit.fee);
   const height = (await node.status()).height;
   const rates = [];
   let limits = null;

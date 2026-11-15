@@ -158,6 +158,9 @@ ok(`Bob's lock address ${bobTrade.output.address} (T1 ${new Date(bobTrade.htlc.t
 const paid = await payTo('bob', bobTrade.output.address, listing.want);
 await mine(1);
 ok(`Bob paid 0.5 LTC to it from his own wallet: ${paid.txid}:${paid.vout}, mined`);
+const dust = await payTo('bob', bobTrade.output.address, 3300n);
+await mine(1);
+ok(`and 3,300 litoshi of dust to the same address, as anyone can: ${dust.txid}:${dust.vout}, mined`);
 
 await own(H.takeInput({ id: listing.id, taker: bob, hash: bobTrade.htlc.hash, t1: bobTrade.htlc.t1, lock: L.encodeTakeLock({ txid: paid.txid, vout: paid.vout, buyer: bobTrade.htlc.buyer }) }));
 const take = (await events(startHeight)).find((e) => e.kind === 'taken' && e.id === listing.id);
@@ -191,12 +194,20 @@ ok(`Bob's page claimed with the secret: Bob got ${Number(got) / 1e8} DLR, the cl
 const claimed = (await events(startHeight)).find((e) => e.kind === 'claimed' && e.id === listing.id);
 const aliceAddr = await address('alice');
 const aliceBefore = await walletBalance('alice');
-const claim = L.claimTx({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 2, network: NET });
+// The seller's page sweeps everything at the lock's address in one claim, the accepted lock first.
+const claim = L.claimAllTx({
+  inputs: [paid, dust].map((o) => ({ txid: o.txid, vout: o.vout, value: o.value, htlc: checked.htlc })),
+  secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 2, network: NET,
+});
+if (claim.spent.length !== 2) fail(`the sweep left out ${claim.skipped.length} output`);
 await broadcast(claim.hex);
 await mine(1);
 const claimStatus = await ltc(`/api/tx/${claim.txid}/status`);
 if (!claimStatus.confirmed) fail('the LTC claim did not confirm');
-ok(`Alice's page read the secret on Ting and claimed the LTC: ${claim.txid} (fee ${claim.fee} litoshi, ${claim.vsize} vB), mined`);
+for (const o of [paid, dust]) {
+  if ((await ltc(`/api/tx/${o.txid}/outspend/${o.vout}`)).txid !== claim.txid) fail(`${o.txid}:${o.vout} is not spent by the claim`);
+}
+ok(`Alice's page read the secret on Ting and swept the lock and the dust in one claim: ${claim.txid} (2 inputs, fee ${claim.fee} litoshi, ${claim.vsize} vB), mined`);
 ok(`Alice's Litecoin wallet: ${aliceBefore} → ${await walletBalance('alice')} LTC`);
 
 step('Trade 2: a take Alice declines, released at once');
@@ -222,6 +233,24 @@ ok(`Bob's page took his 0.2 LTC back at once, long before T1: ${back.txid}, mine
 r = await chain.operate(alice, program, H.withdrawCall(second.listing));
 if (r.status !== 0) fail(`withdraw refused: ${r.reason}`);
 ok('Alice withdrew the listing and has her 5 DLR back');
+
+step('A refund of two locks in one transaction, their T1s already past (Litecoin only, the clock untouched)');
+{
+  const mtp = await medianTime();
+  const buyerKey = crypto.getRandomValues(new Uint8Array(32));
+  const locks = [mtp - 7200, mtp - 3600].map((t1) => ({
+    tag: L.lockTag(program, 999_999, bob), hash: sha256(crypto.getRandomValues(new Uint8Array(32))),
+    seller: publicKey(crypto.getRandomValues(new Uint8Array(32))), buyer: publicKey(buyerKey), t1,
+  }));
+  const outs = [];
+  for (const htlc of locks) outs.push({ ...(await payTo('bob', L.lockOutput(htlc, NET).address, 1_000_000n)), htlc });
+  await mine(1);
+  const sweep = L.refundAllTx({ inputs: outs.map((o) => ({ txid: o.txid, vout: o.vout, value: o.value, htlc: o.htlc })), key: buyerKey, to: bobAddr, feeRate: 2, network: NET });
+  await broadcast(sweep.hex);
+  await mine(1);
+  if (!(await ltc(`/api/tx/${sweep.txid}/status`)).confirmed) fail('the refund sweep did not confirm');
+  ok(`Bob's page refunded two locks in one transaction: ${sweep.txid} (nLockTime ${sweep.tx.locktime}, fee ${sweep.fee} litoshi), mined`);
+}
 
 if (refund) {
   step('Trade 3: a take nobody accepts, refunded on Litecoin after T1');

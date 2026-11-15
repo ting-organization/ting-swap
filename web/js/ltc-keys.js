@@ -100,18 +100,64 @@ export function marksAt(s, n) {
   return { n, pub: publicKey(key), hash: sha256(secretAt(s, n)) };
 }
 
+/** Counters handed out lately, with the tab that took each: what a second tab checks against. */
+const RESERVED = 'ting-swap/ltc/reserved';
+const TAB = Math.random().toString(36).slice(2);
+
+/** Every counter a trade of this browser holds, on any program. */
+function countersInUse() {
+  const used = new Set();
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(TRADES)) continue;
+    const list = read(key, []);
+    if (Array.isArray(list)) for (const t of list) if (Number.isInteger(t?.n)) used.add(t.n);
+  }
+  return used;
+}
+
 /**
- * Takes the next counter for a new trade, skipping any without a key, and
- * keeps the one after it before handing it out: a counter is never used twice.
+ * The next counter from NEXT that has a key and that `used(n)` does not
+ * call taken, nor a trade of this browser holds; NEXT is moved past it and
+ * the counter noted as this tab's before it is handed out.
  */
-export function takeCounter() {
-  const s = seed();
-  if (!s) throw new Error('no seed yet');
+function reserve(s, used) {
+  const held = countersInUse();
+  for (const r of read(RESERVED, [])) if (Number.isInteger(r?.n)) held.add(r.n);
   let n = Number(read(NEXT, 0)) || 0;
-  while (!keyAt(s, n)) n++;
+  for (let tries = 0; !keyAt(s, n) || held.has(n) || used(n); n++) {
+    if (++tries > 10_000) throw new Error('no free counter found');
+  }
   write(NEXT, n + 1);
+  const list = read(RESERVED, []).filter((r) => r && Date.now() - r.at < 86_400_000).slice(-49);
+  write(RESERVED, [...list, { n, tab: TAB, at: Date.now() }]);
   if (Number(read(NEXT, 0)) !== n + 1) throw new Error('this browser did not keep the counter');
   return n;
+}
+
+/**
+ * Takes the next counter for a new trade, skipping any without a key, any a
+ * trade of this browser holds, and any `used(n)` says the chain already shows
+ * (a listing with its key, a take with its secret's hash: a backup code used in
+ * two browsers, or a restore that could not see a lock). The counter after it
+ * is kept before it is handed out, under a lock across this browser's tabs
+ * where the browser has Web Locks; where it has not, the page waits a moment
+ * and takes another if a second tab took the same one. A counter is never
+ * used twice.
+ */
+export async function takeCounter(used = () => false) {
+  const s = seed();
+  if (!s) throw new Error('no seed yet');
+  if (globalThis.navigator?.locks?.request) {
+    return navigator.locks.request('ting-swap/ltc/counter', () => reserve(s, used));
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const n = reserve(s, used);
+    await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+    const takers = read(RESERVED, []).filter((r) => r?.n === n);
+    if (takers.length === 1 && takers[0].tab === TAB) return n;
+  }
+  throw new Error('another tab of this page keeps taking the same keys: close it, and try again');
 }
 
 export const nextCounter = () => Number(read(NEXT, 0)) || 0;

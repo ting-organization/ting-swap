@@ -28,8 +28,11 @@ const WITHDRAW: &str =
 const COIN_CODE: &str = "c675a4b753b61b50ae4b63cde122171f8f2bfb9a05a92df895633ca8c351e4d6";
 
 const GAP: u64 = 21_600;
-const MIN_WINDOW: u64 = 3_600;
+const MIN_WINDOW: u64 = 21_600;
 const MAX_WINDOW: u64 = 604_800;
+/// How far ahead of their clocks Ting's nodes admit a block's timestamp
+/// (`CLOCK_SLACK` in the reference node), which a miner may stamp it.
+const CLOCK_SLACK: u64 = 7_200;
 
 /// The block timestamp the tests start at.
 const T0: u64 = 1_800_000_000;
@@ -979,6 +982,22 @@ fn an_offer_puts_the_coins_in_the_program_and_lists_them() {
     assert_eq!(r.result, 2u64.to_le_bytes());
     reverts(&chain.call(vec![8, 1, 0]), "bad input");
     reverts(&chain.call([query(8, 1), vec![0]].concat()), "bad input");
+
+    // At the least window, a lock lasts 6 hours: a block stamped as far
+    // ahead as nodes admit, right after the accept, still cannot refund it.
+    let secret: Id = [0x77; 32];
+    let hash = chain.sha256(&secret);
+    let t1 = T0 + 5 + MIN_WINDOW + GAP;
+    ok(&chain.take(2, &carol, &hash, t1, &ltc_lock(2)));
+    ok(&chain.accept(b"bob", 2, &carol, &hash, t1));
+    let deadline = T0 + 5 + MIN_WINDOW;
+    assert_eq!(chain.lock(2).unwrap().deadline, deadline);
+    chain.at(T0 + 5 + CLOCK_SLACK);
+    reverts(&chain.refund(2), "too early");
+    chain.at(deadline);
+    reverts(&chain.refund(2), "too early");
+    ok(&chain.claim(2, &secret));
+    assert_eq!(chain.balance(&gold, &carol), START + 7);
 }
 
 #[test]
@@ -1032,6 +1051,9 @@ fn an_offer_is_refused_unless_its_values_are_in_range() {
         (good.with(|t| t.key = vec![2; 66]), "bad key"),
         (good.with(|t| t.window = 0), "bad window"),
         (good.with(|t| t.window = MIN_WINDOW - 1), "bad window"),
+        // Not within reach of a block stamped ahead of the clock.
+        (good.with(|t| t.window = CLOCK_SLACK), "bad window"),
+        (good.with(|t| t.window = 3_600), "bad window"),
         (good.with(|t| t.window = MAX_WINDOW + 1), "bad window"),
         (good.with(|t| t.window = u64::MAX), "bad window"),
         (good.with(|t| t.taker = Some(ZERO)), "bad taker"),
