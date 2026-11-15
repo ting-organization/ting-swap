@@ -73,9 +73,10 @@ unspent and lasts long enough. Before claiming it checks that the accept names t
 buyer's account, hash and lock end exactly, that the lock record on chain says the same
 and is buried deep enough, and that the deadline is far enough off for a claim to get in
 safely. Takes and releases cost nothing to post, so anyone can post them: a release
-counts only when its signature verifies, and the seller's claim sweeps every output the
-secret opens, so that a dust take cannot hold it back. Each trade's automatic steps run
-whatever page view is open.
+counts only when its signature verifies, and the seller's claim spends the lock it
+accepted and nothing else, so that a dust take cannot hold it back and the buyer's other
+payments stay theirs. A seller's page follows every listing made with its key, copies
+included. Each trade's automatic steps run whatever page view is open.
 
 **Keys live in the browser.** Each trade's Litecoin key and secret derive from one seed
 kept in the browser; its backup code finds the trades again in another browser.

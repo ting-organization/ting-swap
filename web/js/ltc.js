@@ -792,6 +792,8 @@ const finishAll = ({ tx, kept, skipped, fee, total }) => ({
  * key, to, feeRate, network }`, each input `{ txid, vout, value, htlc }` with
  * the secret's hash and the seller's key; gives `{ hex, txid, fee, vsize, tx,
  * value, spent, skipped }`. With one input it is `claimTx`'s transaction.
+ * The page does not sweep: its seller claims the accepted lock alone, since
+ * whatever else is at the lock address is the buyer's (HTLC.md, the page).
  */
 export function claimAllTx({ inputs, secret, key, ...options }) {
   checkBytes(secret, 32, 'the secret');

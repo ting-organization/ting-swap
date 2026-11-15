@@ -194,20 +194,16 @@ ok(`Bob's page claimed with the secret: Bob got ${Number(got) / 1e8} DLR, the cl
 const claimed = (await events(startHeight)).find((e) => e.kind === 'claimed' && e.id === listing.id);
 const aliceAddr = await address('alice');
 const aliceBefore = await walletBalance('alice');
-// The seller's page sweeps everything at the lock's address in one claim, the accepted lock first.
-const claim = L.claimAllTx({
-  inputs: [paid, dust].map((o) => ({ txid: o.txid, vout: o.vout, value: o.value, htlc: checked.htlc })),
-  secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 2, network: NET,
-});
-if (claim.spent.length !== 2) fail(`the sweep left out ${claim.skipped.length} output`);
+// The seller's page claims the accepted lock, and only that: the dust beside it stays the buyer's.
+const claim = L.claimTx({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 2, network: NET });
 await broadcast(claim.hex);
 await mine(1);
 const claimStatus = await ltc(`/api/tx/${claim.txid}/status`);
 if (!claimStatus.confirmed) fail('the LTC claim did not confirm');
-for (const o of [paid, dust]) {
-  if ((await ltc(`/api/tx/${o.txid}/outspend/${o.vout}`)).txid !== claim.txid) fail(`${o.txid}:${o.vout} is not spent by the claim`);
-}
-ok(`Alice's page read the secret on Ting and swept the lock and the dust in one claim: ${claim.txid} (2 inputs, fee ${claim.fee} litoshi, ${claim.vsize} vB), mined`);
+if (L.parseTx(claim.hex).inputs.length !== 1) fail('the claim spends more than the accepted lock');
+if ((await ltc(`/api/tx/${paid.txid}/outspend/${paid.vout}`)).txid !== claim.txid) fail('the accepted lock is not spent by the claim');
+if ((await ltc(`/api/tx/${dust.txid}/outspend/${dust.vout}`)).spent) fail('the dust beside the lock was spent');
+ok(`Alice's page read the secret on Ting and claimed the accepted lock alone: ${claim.txid} (fee ${claim.fee} litoshi, ${claim.vsize} vB), mined; the dust beside it is unspent, the buyer's to refund after T1`);
 ok(`Alice's Litecoin wallet: ${aliceBefore} → ${await walletBalance('alice')} LTC`);
 
 step('Trade 2: a take Alice declines, released at once');
