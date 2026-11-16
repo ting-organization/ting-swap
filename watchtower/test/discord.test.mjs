@@ -29,26 +29,33 @@ test('commands and buttons: watch, unwatch, watching', async () => {
     welcome: async () => dmOk,
   };
   const user = { id: '1001' };
-  assert.deepEqual(await answer({ type: 1 }, hooks), { type: 1 }, 'Discord\'s ping');
+  // What the user ends up seeing: the reply itself, or the deferred one's answer.
+  const seen = async (interaction) => {
+    const r = answer(interaction, hooks);
+    return r.later ? { deferred: r.now, text: await r.later() } : { now: r.now, text: r.now.data?.content };
+  };
+  assert.deepEqual(answer({ type: 1 }, hooks).now, { type: 1 }, 'Discord\'s ping');
 
-  const watched = await answer({ type: 2, member: { user }, data: { name: 'watch', options: [{ name: 'listing', value: 42 }, { name: 'role', value: 'seller' }] } }, hooks);
-  assert.equal(watched.data.flags, 64, 'only the user sees the answer');
-  assert.match(watched.data.content, /listing #42 at each step that needs you as its seller/);
+  const watched = await seen({ type: 2, member: { user }, data: { name: 'watch', options: [{ name: 'listing', value: 42 }, { name: 'role', value: 'seller' }] } });
+  assert.deepEqual(watched.deferred, { type: 5, data: { flags: 64 } }, 'answered at once with a deferred reply only the user sees');
+  assert.match(watched.text, /listing #42 at each step that needs you as its seller/);
   assert.deepEqual(S.watchersOf(state, 42), [['1001', 'seller']]);
 
-  const button = await answer({ type: 3, user: { id: '1002' }, data: { custom_id: 'watch:42:buyer' } }, hooks);
-  assert.match(button.data.content, /as its buyer/);
+  const button = await seen({ type: 3, user: { id: '1002' }, data: { custom_id: 'watch:42:buyer' } });
+  assert.match(button.text, /as its buyer/);
   assert.deepEqual(S.watchersOf(state, 42), [['1001', 'seller'], ['1002', 'buyer']]);
 
-  assert.match((await answer({ type: 2, member: { user }, data: { name: 'watching' } }, hooks)).data.content, /#42 \(seller\)/);
-  assert.match((await answer({ type: 2, member: { user }, data: { name: 'watch', options: [{ name: 'listing', value: 7 }, { name: 'role', value: 'seller' }] } }, hooks)).data.content, /no listing #7/);
-  assert.match((await answer({ type: 3, user, data: { custom_id: 'watch:42:thief' } }, hooks)).data.content, /Not a button/);
+  const list = await seen({ type: 2, member: { user }, data: { name: 'watching' } });
+  assert.equal(list.now.data.flags, 64);
+  assert.match(list.text, /#42 \(seller\)/);
+  assert.match((await seen({ type: 2, member: { user }, data: { name: 'watch', options: [{ name: 'listing', value: 7 }, { name: 'role', value: 'seller' }] } })).text, /no listing #7/);
+  assert.match((await seen({ type: 3, user, data: { custom_id: 'watch:42:thief' } })).text, /Not a button/);
 
   dmOk = false;
-  const refused = await answer({ type: 3, user: { id: '1003' }, data: { custom_id: 'watch:42:buyer' } }, hooks);
-  assert.match(refused.data.content, /cannot send you direct messages/);
+  const refused = await seen({ type: 3, user: { id: '1003' }, data: { custom_id: 'watch:42:buyer' } });
+  assert.match(refused.text, /cannot send you direct messages/);
   assert.equal(S.watchersOf(state, 42).length, 2, 'no watcher who cannot get messages');
 
-  await answer({ type: 2, member: { user }, data: { name: 'unwatch', options: [{ name: 'listing', value: 42 }] } }, hooks);
+  await seen({ type: 2, member: { user }, data: { name: 'unwatch', options: [{ name: 'listing', value: 42 }] } });
   assert.deepEqual(S.watchersOf(state, 42), [['1002', 'buyer']]);
 });

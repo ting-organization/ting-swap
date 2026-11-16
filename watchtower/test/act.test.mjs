@@ -55,13 +55,29 @@ test('the seller\'s signed claim goes out once the buyer\'s claim is on Ting, an
   assert.equal(state.claims[`${F.LOCK_TXID}:1`].spent.by, expected.txid);
 });
 
-test('no claim from a forged signature, nor after a refund', async () => {
+test('no claim from a forged signature', async () => {
   const litecoin = explorer();
   const state = empty();
   const forged = F.signedClaimData(1, { key: F.buyerKey });
   const trades = tradesOf([F.listed(1), F.taken(1), F.released(1, forged), F.accepted(1), F.claimed(1)], F.coin);
   await sendClaims({ trades, program: F.program, net: F.NET, outOf: () => F.lockOut(1), litecoin, state, now: 1, dryRun: false, log: quiet });
   assert.equal(litecoin.sent.length, 0);
+});
+
+test('no claim when two outputs at the lock address match the accept, and the right one when one does', async () => {
+  const litecoin = explorer();
+  const state = empty();
+  const other = 'd3'.repeat(32);
+  // The seller's page signed a claim at each Accept click; the other output's came first.
+  const evs = [F.listed(1), F.taken(1, { txid: other, vout: 0 }), F.taken(1), F.released(1, F.signedClaimData(1, { txid: other, vout: 0 })), F.released(1, F.signedClaimData(1)), F.accepted(1), F.claimed(1)];
+  const run = (outOf) => sendClaims({ trades: tradesOf(evs, F.coin), program: F.program, net: F.NET, outOf, litecoin, state, now: 1, dryRun: false, log: quiet });
+  await run(() => F.lockOut(1));
+  assert.equal(litecoin.sent.length, 0, 'both pay: the watchtower cannot tell which was accepted');
+  await run((lock) => (lock.txid === other ? undefined : F.lockOut(1)));
+  assert.equal(litecoin.sent.length, 0, 'one not read yet: nothing');
+  await run((lock) => (lock.txid === other ? { missing: true } : F.lockOut(1)));
+  assert.equal(litecoin.sent.length, 1);
+  assert.equal(L.parseTx(litecoin.sent[0]).inputs[0].txid, F.LOCK_TXID, 'the claim of the one that pays');
 });
 
 test('the refund on Ting: past the deadline by the clock and by the tip, with the lock still there', async () => {

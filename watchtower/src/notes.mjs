@@ -5,7 +5,7 @@
 // the work.
 import { hex } from '../../web/js/bytes.js';
 import { formatAmount, rate } from '../../web/js/swap.js';
-import { acceptBy, acceptedLocks, closed, FIRST_CLAIM_BEFORE, lockOf, outKey, pays, status } from './trades.mjs';
+import { acceptBy, closed, FIRST_CLAIM_BEFORE, lockOf, outKey, pays, status } from './trades.mjs';
 
 const HOUR = 3600;
 
@@ -61,9 +61,10 @@ export function feedMessage(trade, { coin, usd, pageUrl, locked }) {
 
 /**
  * The reminders due now for one watcher of a trade, as `{ key, text }`.
- * `view` is what was read: `outOf(lock)` (the lock's output this round, or
- * undefined), `claim` (the watchtower's record of the seller's claim it sent,
- * if any), `ltcTip` (`{ mtp }`), `program`, `net`, `coin`, `tconfs`, `now`.
+ * `view` is what was read: `outOf(lock)` (the lock's output as last read, or
+ * undefined), `claimOf(trade)` (trades.mjs's claimOf), `claim` (the
+ * watchtower's record of the seller's claim it sent, if any), `ltcTip`
+ * (`{ mtp }`), `program`, `net`, `coin`, `tconfs`, `now`.
  */
 export function notesFor(trade, role, view) {
   const { now, coin } = view;
@@ -73,9 +74,10 @@ export function notesFor(trade, role, view) {
   const add = (key, text) => notes.push({ key, text });
   const l = trade.listed;
   const acc = trade.accepted;
+  // Locks that pay and are not spent: one released and taken back, or refunded, asks nothing of anyone.
   const paying = trade.takes
     .map((take) => ({ take, lock: lockOf(trade, take, view.program, view.net) }))
-    .filter(({ lock }) => pays(lock, view.outOf(lock), l.want));
+    .filter(({ lock }) => pays(lock, view.outOf(lock), l.want) && !view.outOf(lock).spent);
 
   if (role === 'seller') {
     if (!acc && !trade.withdrawn) {
@@ -87,16 +89,18 @@ export function notesFor(trade, role, view) {
       }
     }
     if (trade.claimed && acc) {
-      const sent = view.claim;
-      const outs = acceptedLocks(trade, view.program, view.net).map(({ lock }) => view.outOf(lock)).filter(Boolean);
-      const spent = outs.find((o) => o.spent);
-      if (sent) add('claimed', `The buyer claimed the ${dlr} on listing ${id}, which made the secret public. Your signed claim of the ${ltc} was sent to your address: \`${sent.txid}\`.`);
-      else if (!spent) add('claimed', `The buyer claimed the ${dlr} on listing ${id}. The watchtower found no signed claim of yours on Ting: open your page before ${when(acc.t1)} to claim your ${ltc}.`);
-      if (spent?.spenderConfirmed) {
-        add('ltc-done', sent && spent.spender === sent.txid
-          ? `Done: your claim of the ${ltc} on listing ${id} is in a Litecoin block.`
-          : `Listing ${id}: the Litecoin lock was spent in a block, by \`${spent.spender}\`. Your page shows whether that was your claim.`);
-      } else if (!spent && acc.t1 - now <= 6 * HOUR && acc.t1 > now) {
+      // Said only of what was read: an explorer that failed, or a send Litecoin did not take, says nothing yet.
+      const r = view.claimOf(trade);
+      const sent = view.claim && !view.claim.error ? view.claim : null;
+      const out = r.state === 'one' ? r.out : null;
+      if (sent) add('claim-sent', `The buyer claimed the ${dlr} on listing ${id}, which made the secret public. Your signed claim of the ${ltc} was sent to your address: \`${sent.txid}\`.`);
+      else if (out && !out.spent && !r.claim) add('claim-missing', `The buyer claimed the ${dlr} on listing ${id}. There is no signed claim of yours on Ting for the accepted lock: open your page before ${when(acc.t1)} to claim your ${ltc}.`);
+      else if (r.state === 'many') add('claim-many', `The buyer claimed the ${dlr} on listing ${id}. More than one output at your lock address matches the accept, and the watchtower cannot tell which you accepted, so it sends no claim: open your page before ${when(acc.t1)} to claim your ${ltc}.`);
+      if (out?.spent && out.spenderConfirmed) {
+        add('ltc-done', out.spender === (sent?.txid ?? r.claimTxid)
+          ? `Done: your signed claim of the ${ltc} on listing ${id} is in a Litecoin block.`
+          : `Listing ${id}: the Litecoin lock was spent in a block, by \`${out.spender}\`. Your page shows whether that was your claim.`);
+      } else if (out && !out.spent && acc.t1 - now <= 6 * HOUR && acc.t1 > now) {
         add('ltc-late', `Listing ${id}: your ${ltc} is still not claimed, and the buyer can refund it after ${when(acc.t1)}. Open your page now.`);
       }
     }

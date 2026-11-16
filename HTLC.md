@@ -498,7 +498,12 @@ claimed event is on Ting (checked as the pages check it, and sent again while th
 explorer does not know it, until the lock is spent), and the refund on Ting of an
 accepted listing whose deadline has passed by the clock and by Ting's tip, with the lock
 record still there. Going by the clock as well as the tip, it never helps a block stamped
-ahead of time. It also keeps a Discord feed of the listings and reminds, by direct
+ahead of time. The accept names no outpoint, and only the seller's page knows which accept
+link was approved, so it sends a claim only when every take matching the accept has been
+read and exactly one pays its script at least the wanted amount, and only that lock's
+signed claim; with two, it leaves the claim to the pages. Its Litecoin reads follow the
+page's rules, at most 12 outputs a round, so nothing posted for free on Ting can make it
+read more, nor push the lock a claim needs out of its turn. It also keeps a Discord feed of the listings and reminds, by direct
 message, those who watch a listing at the steps that need them. Nothing depends on it:
 the pages do every step themselves, and its reminders say so.
 

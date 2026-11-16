@@ -12,7 +12,10 @@ Ting and the locks on Litecoin, and:
   until the LTC is claimed, and either side when the trade ends or a refund is due;
 - **finishes the seller's signed claim** once the buyer's claim on Ting makes the secret
   public, and sends it to Litecoin, again while the explorer does not know it, until
-  the lock is spent ([HTLC.md](../HTLC.md), "Spending it");
+  the lock is spent ([HTLC.md](../HTLC.md), "Spending it"). It does so only when Litecoin
+  shows which lock the accept was for: every take matching the accept read, and exactly
+  one paying its script at least the wanted amount. With two, the pages decide, and the
+  seller is told to open theirs;
 - **sends the DLR refund** on Ting once an accepted listing's deadline has passed, by the
   clock and by Ting's tip, with no claim.
 
@@ -32,7 +35,18 @@ node watchtower/src/main.mjs --dry-run
 reads production as `LTC_PRODUCTION` in `web/js/config.js` pins it (node1, the HTLC
 program, Daler, Litecoin mainnet through litecoinspace.org), checks the program's and the
 coin's CodeHashes as the page does, and prints what it would post, message and send,
-sending nothing. Without `--dry-run`, and with the Discord settings below, it does them.
+sending nothing and keeping nothing: it writes no state file, so the run after it posts
+and sends everything. Without `--dry-run`, it sends claims and refunds; without
+`DISCORD_TOKEN` it still only prints the feed and the reminders, and keeps no feed
+message or reminder as done, so that they go out once the token is there.
+
+Each round reads Ting, then at most 12 Litecoin outputs (two requests each), by the
+page's rules: one Litecoin did not have again after 5 minutes, one that pays another
+script or is spent in a block never again, the lock a claimed listing's signed claim
+spends every round until a spend of it is in a block, and the rest every 10 minutes, the
+least recently read first. Then it sends claims and refunds. The feed and the reminders
+run apart from that, so that a slow Discord never holds them up, and no request waits
+longer than 20 seconds.
 
 A test setup names the development chain and a regtest or testnet explorer, like the
 page's address does:
@@ -50,13 +64,15 @@ Settings, as environment variables:
 | `DISCORD_PUBLIC_KEY` | The application's public key, which signs each interaction; without it there is no interactions endpoint |
 | `DISCORD_CHANNEL` | The feed channel's id |
 | `PAGE_URL` | The page the feed links to; `https://ting-organization.github.io/ting-swap/` by default |
-| `STATE_FILE` | Where it keeps who watches what and what it sent; `watchtower-state.json` |
+| `FEED_MIN_LTC` | The least LTC a listing must want to get a feed message, so that dust listings cannot flood the channel; `0.01` by default. Any listing can still be watched with `/watch` |
+| `STATE_FILE` | Where it keeps who watches what, what it sent and the outputs it read; `watchtower-state.json` |
 | `PORT`, `HOST` | The interactions endpoint, `127.0.0.1:8787` by default, behind an HTTPS proxy |
 | `POLL_SECONDS` | Seconds between rounds, 15 by default |
 | `DRY_RUN=1` | The same as `--dry-run` |
 
 The state file holds nothing secret; losing it loses only that bookkeeping (watchers,
-the feed's message ids, the reminders sent).
+the feed's message ids, the reminders sent, the outputs read). A feed message a
+moderator deletes is posted anew.
 
 ## Discord
 
@@ -74,7 +90,9 @@ People then watch a listing with the feed message's **Remind me: seller** or **R
 buyer** button, or `/watch listing:42 role:seller`; `/unwatch` and `/watching` do what
 they say. Watching asks for nothing but the listing: everything the reminders say is
 public on the two chains. The bot can message only those who allow direct messages from
-the server's members, and says so when it cannot.
+the server's members, and says so when it cannot. Watching answers at once with a reply
+only its user sees, which says the bot is working, and replaces it with the answer once
+the first direct message is sent, so Discord's 3 seconds are never missed.
 
 ## Tests
 
@@ -82,9 +100,13 @@ the server's members, and says so when it cannot.
 node --test "watchtower/test/*.test.mjs"
 ```
 
-They build a listing's events with the page's own encodings and real keys, and check
-which listings the watchtower reads, that it finds the seller's signed claim only when it
-verifies and sends exactly the claim the seller's key makes, never before the buyer's
-claim and never again once the lock is spent, that it sends a refund only past the
-deadline with the lock still there, which reminders are due when, the feed message, the
-interactions' signature check, and the commands and buttons.
+They build a listing's events with the page's own encodings and real keys, and check:
+- which listings the watchtower reads;
+- that it finds the seller's signed claim only when it verifies, and sends exactly the
+  claim the seller's key makes, only when exactly one output pays, never before the
+  buyer's claim, and never again once the lock is spent;
+- that it sends a refund only past the deadline with the lock still there;
+- which outputs it reads when, within its budget, however many takes are posted;
+- which reminders are due when, and that only one Discord really sent counts as sent;
+- the feed message, and that a deleted one is posted anew;
+- the interactions' signature check, and the commands and buttons.

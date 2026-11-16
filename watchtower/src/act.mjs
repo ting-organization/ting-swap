@@ -7,7 +7,7 @@
 //   program sends the coins back to the maker, whoever sends it.
 import * as H from '../../web/js/htlc.js';
 import * as L from '../../web/js/ltc.js';
-import { outKey, signedClaimFor } from './trades.mjs';
+import { claimOf, outKey } from './trades.mjs';
 
 /** A transaction sent that the explorer or the node does not know is sent again after this many seconds. */
 export const RESEND_AFTER = 120;
@@ -17,23 +17,25 @@ export const REFUND_MARGIN = 120;
 /**
  * Finishes and sends the seller's signed claim of every accepted lock whose
  * buyer claimed on Ting, and sends it again while the explorer does not know
- * it, until the lock is spent. `outOf(lock)` is the lock's output as read this
- * round. Returns what it did, for the log and the notes.
+ * it, until the lock is spent. Only when Litecoin shows which lock the accept
+ * was for (claimOf's `one`): with two paying outputs at the lock address, the
+ * pages decide. `outOf(lock)` is the lock's output as last read. Returns what
+ * it did, for the log and the notes.
  */
 export async function sendClaims({ trades, program, net, outOf, litecoin, state, now, dryRun, log }) {
   const done = [];
   for (const trade of trades.values()) {
     if (!trade.claimed || trade.refunded) continue;
-    const found = signedClaimFor(trade, program, net, outOf);
-    if (!found) continue;
-    const { lock, out, claim } = found;
+    const r = claimOf(trade, program, net, outOf);
+    if (r.state !== 'one') continue;
+    const { lock, out, claim } = r;
     const key = outKey(lock);
     const kept = state.claims[key];
     if (out.spent) {
-      if (kept && !kept.spent) kept.spent = { by: out.spender, confirmed: out.spenderConfirmed, at: now };
-      else if (kept?.spent && out.spenderConfirmed && !kept.spent.confirmed) kept.spent.confirmed = true;
+      if (kept) kept.spent = { by: out.spender, confirmed: out.spenderConfirmed, at: kept.spent?.at ?? now };
       continue;
     }
+    if (!claim) continue;
     let tx;
     try {
       tx = L.finishClaim({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, out: claim.out, signature: claim.signature, secret: trade.claimed.secret });

@@ -1,10 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { feedMessage, notesFor } from '../src/notes.mjs';
-import { acceptBy, FIRST_CLAIM_BEFORE, tradesOf } from '../src/trades.mjs';
+import { acceptBy, claimOf, FIRST_CLAIM_BEFORE, tradesOf } from '../src/trades.mjs';
 import * as F from './fixture.mjs';
 
-const view = (fields = {}) => ({ now: 1_900_000_100, coin: F.COIN, program: F.program, net: F.NET, tconfs: 30, ltcTip: { mtp: 0 }, outOf: () => F.lockOut(1), claim: null, ...fields });
+const view = (fields = {}) => {
+  const v = { now: 1_900_000_100, coin: F.COIN, program: F.program, net: F.NET, tconfs: 30, ltcTip: { mtp: 0 }, outOf: () => F.lockOut(1), claim: null, ...fields };
+  return { claimOf: (t) => claimOf(t, F.program, F.NET, v.outOf), ...v };
+};
 const keys = (notes) => notes.map((n) => n.key);
 const trade = (...evs) => tradesOf([F.listed(1), ...evs], F.coin).get(1);
 
@@ -26,18 +29,25 @@ test('the seller: a lock that pays, then the time to accept running out', () => 
 test('the seller after the buyer\'s claim: sent, or open the page, then done', () => {
   const t = trade(F.taken(1), F.accepted(1), F.claimed(1));
   const missing = notesFor(t, 'seller', view());
-  assert.deepEqual(keys(missing), ['claimed']);
-  assert.match(missing[0].text, /found no signed claim of yours on Ting: open your page before/);
-  const sent = notesFor(t, 'seller', view({ claim: { txid: 'ab'.repeat(32) } }));
+  assert.deepEqual(keys(missing), ['claim-missing']);
+  assert.match(missing[0].text, /no signed claim of yours on Ting for the accepted lock: open your page before/);
+  assert.deepEqual(keys(notesFor(t, 'seller', view({ outOf: () => undefined }))), [], 'the explorer could not be read: nothing said yet');
+  assert.deepEqual(keys(notesFor(t, 'seller', view({ claim: { txid: 'ab'.repeat(32), error: 'refused' } }))), ['claim-missing'], 'a send that failed is no send');
+  const signed = trade(F.taken(1), F.released(1, F.signedClaimData(1)), F.accepted(1), F.claimed(1));
+  assert.deepEqual(keys(notesFor(signed, 'seller', view({ claim: { txid: 'ab'.repeat(32), error: 'refused' } }))), [], 'a signed claim on Ting but not sent yet: nothing said yet');
+  const sent = notesFor(signed, 'seller', view({ claim: { txid: 'ab'.repeat(32) } }));
+  assert.deepEqual(keys(sent), ['claim-sent']);
   assert.match(sent[0].text, /Your signed claim of the 0\.5 LTC was sent to your address/);
   const late = notesFor(t, 'seller', view({ now: F.T1 - 3600 }));
-  assert.deepEqual(keys(late), ['claimed', 'ltc-late']);
-  const done = notesFor(t, 'seller', view({ claim: { txid: 'ab'.repeat(32) }, outOf: () => F.lockOut(1, { spent: true, spender: 'ab'.repeat(32), spenderConfirmed: true }) }));
-  assert.deepEqual(keys(done), ['claimed', 'ltc-done']);
-  assert.match(done[1].text, /Done: your claim of the 0\.5 LTC on listing #1 is in a Litecoin block/);
+  assert.deepEqual(keys(late), ['claim-missing', 'ltc-late']);
+  const done = notesFor(signed, 'seller', view({ claim: { txid: 'ab'.repeat(32) }, outOf: () => F.lockOut(1, { spent: true, spender: 'ab'.repeat(32), spenderConfirmed: true }) }));
+  assert.deepEqual(keys(done), ['claim-sent', 'ltc-done']);
+  assert.match(done[1].text, /Done: your signed claim of the 0\.5 LTC on listing #1 is in a Litecoin block/);
   const other = notesFor(t, 'seller', view({ outOf: () => F.lockOut(1, { spent: true, spender: 'cd'.repeat(32), spenderConfirmed: true }) }));
   assert.deepEqual(keys(other), ['ltc-done']);
   assert.match(other[0].text, /spent in a block, by `cdcd/);
+  const many = trade(F.taken(1), F.taken(1, { txid: 'd3'.repeat(32), vout: 0 }), F.accepted(1), F.claimed(1));
+  assert.deepEqual(keys(notesFor(many, 'seller', view())), ['claim-many'], 'two outputs match: open your page');
   assert.deepEqual(keys(notesFor(trade(F.taken(1), F.accepted(1), F.refunded(1)), 'seller', view())), ['refunded']);
 });
 

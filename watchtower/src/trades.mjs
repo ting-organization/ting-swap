@@ -89,30 +89,79 @@ export function status(trade, { locked = false } = {}) {
 
 export const closed = (trade) => Boolean(trade.claimed || trade.refunded || trade.withdrawn);
 
-/**
- * The seller's signed claim for the accepted lock: the first posted whose
- * outpoint is a take matching the accept and whose signature verifies against
- * the listing's key, the rebuilt script and the output's value as Litecoin has
- * it (`outOf(lock)`). `{ take, lock, out, claim }`, or null.
- */
-export function signedClaimFor(trade, program, net, outOf) {
-  if (!trade.accepted) return null;
-  for (const s of trade.signedClaims) {
-    const take = trade.takes.find((t) => matchesAccept(t, trade.accepted) && t.lockOf.txid === s.claim.txid && t.lockOf.vout === s.claim.vout);
-    const lock = take && lockOf(trade, take, program, net);
-    const out = lock && outOf(lock);
-    if (!out || out.missing || out.script !== hex(lock.scriptPubKey)) continue;
-    let ok = false;
-    try {
-      ok = L.verifyClaimSignature({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, out: s.claim.out, signature: s.claim.signature });
-    } catch { /* not a signature */ }
-    if (ok) return { take, lock, out, claim: s.claim };
-  }
-  return null;
-}
-
 /** The takes matching the accept, each with its lock: what the accept may be for. */
 export function acceptedLocks(trade, program, net) {
   if (!trade.accepted) return [];
   return trade.takes.filter((t) => matchesAccept(t, trade.accepted)).map((t) => ({ take: t, lock: lockOf(trade, t, program, net) })).filter((x) => x.lock);
+}
+
+/**
+ * The lock the accept was for, as far as Litecoin shows it. The accept names a
+ * taker, a hash and T1, not an outpoint, so every take with those matches it,
+ * and two outputs at the lock address (a buyer who paid twice, a take naming
+ * each) both do; the seller's page signs a claim at each Accept click. Only
+ * the seller's page knows which link was approved, so the watchtower goes by
+ * Litecoin alone (`outOf(lock)`, the output as read, undefined if not):
+ * - `one`: every matching take's output was read, and exactly one pays its
+ *   script at least the wanted amount. That is the accepted lock: the seller's
+ *   page accepts only a lock that does, and only a claim, or its buyer after
+ *   T1, can spend it. `{ state, take, lock, out }`.
+ * - `many`: more than one pays. The watchtower leaves the claim to the pages.
+ * - `unread`: a matching take's output is not read yet, or its read failed.
+ * - `none`: all are read, and none pays.
+ */
+export function acceptedLockOf(trade, program, net, outOf) {
+  let found = null;
+  let paying = 0;
+  for (const c of acceptedLocks(trade, program, net)) {
+    const out = outOf(c.lock);
+    if (!out) return { state: 'unread' };
+    if (pays(c.lock, out, trade.listed.want)) {
+      paying++;
+      found = { ...c, out };
+    }
+  }
+  if (paying > 1) return { state: 'many' };
+  return found ? { state: 'one', ...found } : { state: 'none' };
+}
+
+const checks = new Map();
+
+/**
+ * The seller's signed claim of a lock whose output `out` Litecoin has: the
+ * first posted for that outpoint whose signature verifies against the
+ * listing's key, the rebuilt script and the output's value. Release data is
+ * free to post, so each check is kept, by data, script and value, as the page
+ * keeps its own; with `verify` false, only checks already made count. Null
+ * without one.
+ */
+export function signedClaimOf(trade, lock, out, { verify = true } = {}) {
+  for (const s of trade.signedClaims) {
+    if (s.claim.txid !== lock.txid || s.claim.vout !== lock.vout) continue;
+    const key = `${hex(s.data)}|${hex(lock.script)}|${out.value}`;
+    if (!checks.has(key)) {
+      if (!verify) continue;
+      let ok = false;
+      try {
+        ok = L.verifyClaimSignature({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, out: s.claim.out, signature: s.claim.signature });
+      } catch { /* not a signature */ }
+      checks.set(key, ok);
+    }
+    if (checks.get(key)) return s.claim;
+  }
+  return null;
+}
+
+/**
+ * Where the seller's LTC claim of an accepted listing stands for the
+ * watchtower: acceptedLockOf, and with `one`, the signed claim of that lock
+ * (`claim`, or null) and the claim's txid. Signatures are checked anew only
+ * for a lock not spent in a block: release data posted later is never looked
+ * at.
+ */
+export function claimOf(trade, program, net, outOf) {
+  const r = acceptedLockOf(trade, program, net, outOf);
+  if (r.state !== 'one') return { ...r, claim: null, claimTxid: null };
+  const claim = signedClaimOf(trade, r.lock, r.out, { verify: !(r.out.spent && r.out.spenderConfirmed) });
+  return { ...r, claim, claimTxid: claim ? L.signedClaimTxid(claim) : null };
 }

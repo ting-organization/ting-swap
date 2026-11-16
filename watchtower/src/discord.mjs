@@ -5,26 +5,40 @@ import { createPublicKey, verify } from 'node:crypto';
 
 const API = 'https://discord.com/api/v10';
 
-/** The REST calls the watchtower makes, as its bot. In a dry run it only prints them. */
+/** How long the watchtower waits out a 429 at most, and how often: a round's claims and refunds do not wait behind Discord. */
+const MAX_WAIT = 10;
+const ATTEMPTS = 3;
+
+/** Whether Discord's answer means the message is gone: deleted by a moderator, or never there. */
+export const gone = (e) => e?.status === 404 || e?.code === 10008;
+
+/**
+ * The REST calls the watchtower makes, as its bot. Without a token, or in a
+ * dry run, it is not `live`: each call is printed and nothing is made, and the
+ * callers keep nothing of it.
+ */
 export class Discord {
   constructor({ token, applicationId, channel, dryRun = false, log = console.log }) {
     this.token = token;
     this.applicationId = applicationId;
     this.channel = channel;
-    this.dryRun = dryRun || !token;
+    this.live = Boolean(token) && !dryRun;
     this.log = log;
     this.dms = new Map();
   }
 
-  async request(method, path, body) {
-    for (let attempt = 0; attempt < 5; attempt++) {
+  async request(method, path, body, { auth = true } = {}) {
+    for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const response = await fetch(API + path, {
         method,
-        headers: { authorization: `Bot ${this.token}`, 'content-type': 'application/json', 'user-agent': 'DiscordBot (ting-swap-watchtower, 1)' },
+        headers: {
+          ...(auth ? { authorization: `Bot ${this.token}` } : {}),
+          'content-type': 'application/json', 'user-agent': 'DiscordBot (ting-swap-watchtower, 1)',
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       if (response.status === 429) {
-        const wait = Number((await response.json().catch(() => ({}))).retry_after ?? 1);
+        const wait = Math.min(MAX_WAIT, Number((await response.json().catch(() => ({}))).retry_after ?? 1));
         await new Promise((r) => setTimeout(r, Math.ceil(wait * 1000) + 50));
         continue;
       }
@@ -35,32 +49,38 @@ export class Discord {
     throw new Error('Discord kept saying to wait');
   }
 
-  /** Posts a feed message; its id. */
+  /** Posts a feed message: its id, or null when not live. */
   async post(message) {
-    if (this.dryRun) {
+    if (!this.live) {
       this.log(`[feed] ${message.embeds[0].title} — ${message.embeds[0].description.replace(/\n/g, ' · ')}`);
-      return `dry-${Date.now()}`;
+      return null;
     }
     return (await this.request('POST', `/channels/${this.channel}/messages`, message)).id;
   }
 
-  /** Edits a feed message in place. */
+  /** Edits a feed message in place; throws, `gone`, when it is not there. */
   async edit(id, message) {
-    if (this.dryRun) {
-      this.log(`[feed edit] ${message.embeds[0].title} — ${message.embeds[0].description.split('\n').at(-1)}`);
-      return;
-    }
     await this.request('PATCH', `/channels/${this.channel}/messages/${id}`, message);
   }
 
-  /** Sends a direct message; throws (code 50007) when the user does not take them. */
+  /** Sends a direct message; throws (code 50007) when the user does not take them. Whether it was really sent. */
   async dm(user, content) {
-    if (this.dryRun) {
+    if (!this.live) {
       this.log(`[dm ${user}] ${content}`);
-      return;
+      return false;
     }
     if (!this.dms.has(user)) this.dms.set(user, (await this.request('POST', '/users/@me/channels', { recipient_id: user })).id);
     await this.request('POST', `/channels/${this.dms.get(user)}/messages`, { content, allowed_mentions: { parse: [] } });
+    return true;
+  }
+
+  /** Replaces a deferred interaction reply with its answer, through the interaction's own token. */
+  async followUp(interaction, content) {
+    if (!this.live) {
+      this.log(`[reply ${interaction.member?.user?.id ?? interaction.user?.id}] ${content}`);
+      return;
+    }
+    await this.request('PATCH', `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, { content, allowed_mentions: { parse: [] } }, { auth: false });
   }
 
   /** Registers the slash commands, for the whole application. */
@@ -94,12 +114,23 @@ export function signedByDiscord(publicKeyHex, signatureHex, timestamp, body) {
 /** An ephemeral reply, which only the one who asked sees. */
 export const reply = (content) => ({ type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } });
 
+/** A deferred ephemeral reply: Discord shows that the bot is working, and the answer replaces it (Discord.followUp). */
+export const DEFERRED = { type: 5, data: { flags: 64 } };
+
 /**
  * What to answer an interaction: Discord's ping, a command or a button. `watch`
  * and `unwatch` change the watch list; `welcome(user, id, role)` sends the
- * first direct message and says whether it could. Returns the response body.
+ * first direct message and says whether it could. Discord wants an answer
+ * within 3 seconds, and a direct message can take longer: watching answers at
+ * once with DEFERRED, and `later` is the answer that then replaces it.
+ * Returns `{ now, later }`, `later` a function giving the text, or undefined.
  */
-export async function answer(interaction, { watch, unwatch, watching, welcome, known }) {
+export function answer(interaction, hooks) {
+  const r = route(interaction, hooks);
+  return typeof r === 'function' ? { now: DEFERRED, later: r } : { now: r };
+}
+
+function route(interaction, { watch, unwatch, watching, welcome, known }) {
   if (interaction.type === 1) return { type: 1 };
   const user = interaction.member?.user?.id ?? interaction.user?.id;
   if (!user) return reply('No user in this interaction.');
@@ -129,8 +160,9 @@ export async function answer(interaction, { watch, unwatch, watching, welcome, k
   }
   if (!Number.isSafeInteger(id) || id < 1 || (role !== 'seller' && role !== 'buyer')) return reply('Name a listing and whether you are its seller or a buyer.');
   if (!known(id)) return reply(`There is no listing #${id} of Ting Swap's Litecoin page.`);
-  const ok = await welcome(user, id, role);
-  if (!ok) return reply('I cannot send you direct messages. Allow direct messages from this server\'s members (the server\'s Privacy settings), then try again.');
-  watch(user, id, role);
-  return reply(`You get a direct message about listing #${id} at each step that needs you as its ${role}. These are reminders only: your page does the work. \`/unwatch listing:${id}\` stops them.`);
+  return async () => {
+    if (!(await welcome(user, id, role))) return 'I cannot send you direct messages. Allow direct messages from this server\'s members (the server\'s Privacy settings), then try again.';
+    watch(user, id, role);
+    return `You get a direct message about listing #${id} at each step that needs you as its ${role}. These are reminders only: your page does the work. \`/unwatch listing:${id}\` stops them.`;
+  };
 }

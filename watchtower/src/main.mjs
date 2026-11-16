@@ -16,9 +16,15 @@ import { decodeCoin } from '../../web/js/swap.js';
 import { sendClaims, sendRefunds } from './act.mjs';
 import { Litecoin, Ting } from './chains.mjs';
 import { answer, Discord, signedByDiscord } from './discord.mjs';
-import { feedMessage, notesFor } from './notes.mjs';
+import { readsDue } from './reads.mjs';
 import * as S from './state.mjs';
-import { acceptedLocks, closed, lockOf, outKey, pays, tradesOf } from './trades.mjs';
+import { sendNotes, updateFeed, welcome } from './tell.mjs';
+import { claimOf, lockOf, pays, tradesOf } from './trades.mjs';
+
+/** No request waits longer than this: one hung connection would hold up a whole round. */
+const FETCH_TIMEOUT = 20_000;
+const plainFetch = globalThis.fetch;
+globalThis.fetch = (url, init = {}) => plainFetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(FETCH_TIMEOUT) });
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -36,18 +42,13 @@ const config = {
   dryRun: flag('dry-run') || env.DRY_RUN === '1',
   statePath: env.STATE_FILE ?? 'watchtower-state.json',
   pageUrl: env.PAGE_URL ?? 'https://ting-organization.github.io/ting-swap/',
+  feedMin: BigInt(Math.round(Number(env.FEED_MIN_LTC ?? '0.01') * 1e8)),
   poll: Number(env.POLL_SECONDS ?? 15) * 1000,
   port: Number(env.PORT ?? 8787),
   host: env.HOST ?? '127.0.0.1',
   discord: { token: env.DISCORD_TOKEN, applicationId: env.DISCORD_APPLICATION_ID, publicKey: env.DISCORD_PUBLIC_KEY, channel: env.DISCORD_CHANNEL },
 };
 
-/** Outputs of takes on open listings read at most this many a round, those never read first: free takes cannot flood the explorer. */
-const OTHER_READS = 8;
-/** An output Litecoin did not have is read again after this long. */
-const MISSING_AGAIN = 300;
-/** Takes matching an accept whose locks are read every round, at most: anyone can post copies of a take. */
-const ACCEPTED_READS = 4;
 const PRICE_EVERY = 600;
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -59,12 +60,21 @@ const ting = new Ting({ node: setup.node, program });
 const litecoin = new Litecoin(setup.ltc);
 const discord = new Discord({ ...config.discord, dryRun: config.dryRun, log });
 const state = S.load(config.statePath);
-const outs = new Map();
+/** The outputs read, by outpoint, `{ out, at }`: kept in the state, so that a restart reads nothing again it need not. */
+const outs = new Map(Object.entries(state.outs ?? {}));
+const failed = new Map();
 let trades = new Map();
 let coin = null;
 let usd = null;
 let usdAt = 0;
 let ltcTip = null;
+
+/** A dry run keeps nothing: what it only printed must not count as done for the run after it. */
+function saveState() {
+  if (config.dryRun) return;
+  state.outs = Object.fromEntries(outs);
+  S.save(config.statePath, state);
+}
 
 if (args[0] === 'register') {
   if (!config.discord.token || !config.discord.applicationId) throw new Error('registering needs DISCORD_TOKEN and DISCORD_APPLICATION_ID');
@@ -86,120 +96,47 @@ async function check() {
 }
 
 const outOf = (lock) => (lock ? outs.get(lock.key)?.out : undefined);
+const claimOfTrade = (trade) => claimOf(trade, program, setup.ltcnet, outOf);
 
 async function readOut(lock) {
   try {
     outs.set(lock.key, { out: await litecoin.out(lock.txid, lock.vout), at: now() });
+    failed.delete(lock.key);
   } catch (e) {
+    failed.set(lock.key, now());
     log(`cannot read ${lock.key} on Litecoin: ${e.message}`);
   }
 }
 
-/**
- * Reads what this round needs of Litecoin: every round, the locks an accept
- * may be for, until a claim of theirs is in a block; in turns, at most
- * OTHER_READS, the other takes' locks of open listings, until each is seen.
- */
+/** Reads what this round needs of Litecoin (reads.mjs). */
 async function readLitecoin() {
   ltcTip = await litecoin.tip().catch((e) => { log(`cannot read Litecoin's tip: ${e.message}`); return ltcTip; });
   if (now() - usdAt > PRICE_EVERY) {
     usd = (await litecoin.usd()) ?? usd;
     usdAt = now();
   }
-  const others = [];
-  for (const trade of trades.values()) {
-    if (trade.accepted && !trade.refunded) {
-      const named = new Set(trade.signedClaims.map((s) => outKey(s.claim)));
-      const locks = acceptedLocks(trade, program, setup.ltcnet).sort((a, b) => Number(named.has(b.lock.key)) - Number(named.has(a.lock.key))).slice(0, ACCEPTED_READS);
-      for (const { lock } of locks) {
-        const seen = outOf(lock);
-        if (seen?.spent && seen.spenderConfirmed) continue;
-        await readOut(lock);
-      }
-    } else if (!closed(trade)) {
-      for (const take of trade.takes) {
-        const lock = lockOf(trade, take, program, setup.ltcnet);
-        if (!lock) continue;
-        const kept = outs.get(lock.key);
-        if (kept && !kept.out.missing) continue;
-        if (kept && now() - kept.at < MISSING_AGAIN) continue;
-        others.push({ lock, at: kept?.at ?? 0 });
-      }
-    }
-  }
-  for (const { lock } of others.sort((a, b) => a.at - b.at).slice(0, OTHER_READS)) await readOut(lock);
+  for (const lock of readsDue({ trades, program, net: setup.ltcnet, outs, failed, now: now(), claimOf: claimOfTrade })) await readOut(lock);
 }
 
-const lockedNow = (trade) => trade.takes.some((take) => pays(lockOf(trade, take, program, setup.ltcnet), outOf(lockOf(trade, take, program, setup.ltcnet)), trade.listed.want));
-
-/**
- * Posts a feed message for every listing not over when first seen, and edits
- * each as it moves on. The USD estimate is LTC's price when it was posted, so
- * that a price change alone edits nothing.
- */
-async function updateFeed() {
-  if (!config.discord.channel && !config.dryRun) return;
-  for (const trade of trades.values()) {
-    const kept = state.feed[trade.id];
-    if (!kept && closed(trade)) continue;
-    const price = kept ? kept.usd ?? null : usd;
-    const message = feedMessage(trade, { coin, usd: price, pageUrl: config.pageUrl, locked: lockedNow(trade) });
-    const text = JSON.stringify(message);
-    if (kept?.text === text) continue;
-    try {
-      if (kept) await discord.edit(kept.message, message);
-      const id = kept?.message ?? (await discord.post(message));
-      state.feed[trade.id] = { message: id, text, usd: price };
-    } catch (e) {
-      log(`#${trade.id}: the feed message did not go out: ${e.message}`);
-    }
-  }
-}
+/** Whether a buyer's lock pays an open listing and is not spent: released and taken back, it is no lock any more. */
+const lockedNow = (trade) => trade.takes.some((take) => {
+  const lock = lockOf(trade, take, program, setup.ltcnet);
+  const o = outOf(lock);
+  return pays(lock, o, trade.listed.want) && !o.spent;
+});
 
 function view(trade) {
+  const claims = Object.values(state.claims).filter((c) => c.listing === trade.id);
   return {
-    now: now(), coin, program, net: setup.ltcnet, tconfs: setup.tconfs, ltcTip, outOf,
-    claim: Object.values(state.claims).find((c) => c.listing === trade.id && !c.error) ?? null,
+    now: now(), coin, program, net: setup.ltcnet, tconfs: setup.tconfs, ltcTip, outOf, claimOf: claimOfTrade,
+    claim: claims.find((c) => !c.error) ?? claims[0] ?? null,
   };
 }
 
-/** Sends each watcher the reminders due to them that they did not get yet. */
-async function sendNotes() {
-  for (const [idText] of Object.entries(state.watch)) {
-    const id = Number(idText);
-    const trade = trades.get(id);
-    if (!trade) continue;
-    for (const [user, role] of S.watchersOf(state, id)) {
-      for (const note of notesFor(trade, role, view(trade))) {
-        const key = S.sentKey(user, id, note.key);
-        if (state.sent[key]) continue;
-        try {
-          await discord.dm(user, note.text);
-          state.sent[key] = now();
-        } catch (e) {
-          log(`#${id}: no direct message to ${user}: ${e.message}`);
-          if (e.code === 50007) state.sent[key] = -now();
-        }
-      }
-    }
-  }
-}
+const printedFeed = new Map();
+const printedNotes = new Set();
 
-/** The first direct message to a new watcher: where the listing stands, and what is due now, which is then sent. */
-async function welcome(user, id, role) {
-  const trade = trades.get(id);
-  const due = notesFor(trade, role, view(trade)).filter((n) => !state.sent[S.sentKey(user, id, n.key)]);
-  const text = [`You are watching listing #${id} as its ${role}. ${config.pageUrl}#/l/${id}`, ...due.map((n) => n.text)].join('\n\n');
-  try {
-    await discord.dm(user, text);
-  } catch (e) {
-    log(`#${id}: no welcome message to ${user}: ${e.message}`);
-    return false;
-  }
-  for (const n of due) state.sent[S.sentKey(user, id, n.key)] = now();
-  return true;
-}
-
+/** The claims and refunds each round; the feed and the reminders apart, so that a slow Discord never holds them up. */
 async function round() {
   await ting.readTip();
   if (production && ting.tip.chainId !== setup.chainId) throw new Error(`the node moved to chain ${ting.tip.chainId}`);
@@ -208,9 +145,27 @@ async function round() {
   const t = now();
   await sendClaims({ trades, program, net: setup.ltcnet, outOf, litecoin, state, now: t, dryRun: config.dryRun, log });
   await sendRefunds({ trades, ting, state, now: t, dryRun: config.dryRun, log });
-  await updateFeed();
-  await sendNotes();
-  S.save(config.statePath, state);
+  saveState();
+  tell();
+}
+
+let telling = null;
+function tell() {
+  if (telling) return;
+  telling = (async () => {
+    try {
+      await updateFeed({
+        trades, state, discord, printed: printedFeed, coin, usd, pageUrl: config.pageUrl, feedMin: config.feedMin,
+        channel: config.discord.channel, lockedNow, log,
+      });
+      await sendNotes({ trades, state, discord, printed: printedNotes, viewOf: view, now: now(), log });
+      saveState();
+    } catch (e) {
+      log(`the feed or the reminders failed: ${e.message}`);
+    } finally {
+      telling = null;
+    }
+  })();
 }
 
 function serve() {
@@ -218,6 +173,13 @@ function serve() {
     log('no DISCORD_PUBLIC_KEY: no interactions endpoint, so no /watch and no buttons');
     return;
   }
+  const hooks = {
+    watch: (user, id, role) => S.watch(state, user, id, role),
+    unwatch: (user, id) => S.unwatch(state, user, id),
+    watching: (user) => S.watching(state, user),
+    known: (id) => trades.has(id),
+    welcome: (user, id, role) => welcome({ trade: trades.get(id), user, role, state, discord, viewOf: view, pageUrl: config.pageUrl, now: now(), dryRun: config.dryRun, log }),
+  };
   createServer((req, res) => {
     if (req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/plain' }).end(`ok, ${trades.size} listings, Ting ${ting.tip?.height ?? '?'}\n`);
@@ -232,29 +194,35 @@ function serve() {
         res.writeHead(401).end('bad signature');
         return;
       }
-      let out;
+      let interaction;
+      let reply;
       try {
-        out = await answer(JSON.parse(body.toString('utf8')), {
-          watch: (user, id, role) => S.watch(state, user, id, role),
-          unwatch: (user, id) => S.unwatch(state, user, id),
-          watching: (user) => S.watching(state, user),
-          known: (id) => trades.has(id),
-          welcome,
-        });
-        S.save(config.statePath, state);
+        interaction = JSON.parse(body.toString('utf8'));
+        reply = answer(interaction, hooks);
       } catch (e) {
         log(`an interaction failed: ${e.message}`);
-        out = { type: 4, data: { content: 'Something went wrong; try again in a minute.', flags: 64 } };
+        reply = { now: { type: 4, data: { content: 'Something went wrong; try again in a minute.', flags: 64 } } };
       }
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(reply.now));
+      saveState();
+      if (!reply.later) return;
+      let text;
+      try {
+        text = await reply.later();
+      } catch (e) {
+        log(`an interaction failed: ${e.message}`);
+        text = 'Something went wrong; try again in a minute.';
+      }
+      saveState();
+      await discord.followUp(interaction, text).catch((e) => log(`no answer to an interaction: ${e.message}`));
     });
   }).listen(config.port, config.host, () => log(`interactions on http://${config.host}:${config.port}/`));
 }
 
 await check();
-log(`watching ${hex(program)} on ${production ? 'Ting' : setup.node}, Litecoin ${setup.ltcnet}${config.dryRun ? ', dry run: nothing is sent' : ''}`);
+log(`watching ${hex(program)} on ${production ? 'Ting' : setup.node}, Litecoin ${setup.ltcnet}${config.dryRun ? ', dry run: nothing is sent or kept' : ''}${discord.live ? '' : ', Discord printed only'}`);
 serve();
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { S.save(config.statePath, state); process.exit(0); });
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { saveState(); process.exit(0); });
 for (;;) {
   try {
     await round();

@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import * as S from '../../web/js/secp256k1.js';
 import { sha256 } from '../../web/js/sha256.js';
 import { utf8 } from '../../web/js/bytes.js';
-import { acceptBy, signedClaimFor, status, tradesOf } from '../src/trades.mjs';
+import * as L from '../../web/js/ltc.js';
+import { acceptBy, acceptedLockOf, claimOf, status, tradesOf } from '../src/trades.mjs';
 import * as F from './fixture.mjs';
 
 test('listings of the page\'s kind only, copies marked', () => {
@@ -36,11 +37,28 @@ test('the signed claim: only the listing key\'s, only for the accepted lock', ()
   const real = F.signedClaimData(1);
   const t = tradesOf([F.listed(1), F.taken(1), F.released(1, forged), F.released(1, elsewhere), F.released(1, real), F.accepted(1)], F.coin).get(1);
   assert.equal(t.signedClaims.length, 3);
-  const found = signedClaimFor(t, F.program, F.NET, outOf);
-  assert.ok(found, 'the real one is found past a forged one and one for another output');
+  const found = claimOf(t, F.program, F.NET, outOf);
+  assert.equal(found.state, 'one');
+  assert.ok(found.claim, 'the real one is found past a forged one and one for another output');
   assert.equal(Buffer.from(found.claim.signature).toString('hex'), Buffer.from(real.subarray(real.length - found.claim.signature.length)).toString('hex'));
+  assert.equal(found.claimTxid, L.signedClaimTxid(L.decodeSignedClaim(real)));
   const noAccept = tradesOf([F.listed(1), F.taken(1), F.released(1, real)], F.coin).get(1);
-  assert.equal(signedClaimFor(noAccept, F.program, F.NET, outOf), null, 'no accept, no claim');
-  assert.equal(signedClaimFor(t, F.program, F.NET, () => F.lockOut(1, { value: F.VALUE + 1 })), null, 'not for another value');
-  assert.equal(signedClaimFor(t, F.program, F.NET, () => undefined), null, 'not before the output is read');
+  assert.equal(claimOf(noAccept, F.program, F.NET, outOf).state, 'none', 'no accept, no lock');
+  assert.equal(claimOf(t, F.program, F.NET, () => F.lockOut(1, { value: F.VALUE + 1 })).claim, null, 'not for another value');
+  assert.equal(claimOf(t, F.program, F.NET, () => undefined).state, 'unread', 'not before the output is read');
+});
+
+test('the accepted lock: only when exactly one matching take\'s output pays', () => {
+  const second = F.taken(1, { txid: 'd3'.repeat(32), vout: 0 });
+  const t = tradesOf([F.listed(1), F.taken(1), second, F.released(1, F.signedClaimData(1, { txid: 'd3'.repeat(32), vout: 0 })), F.released(1, F.signedClaimData(1)), F.accepted(1)], F.coin).get(1);
+  const both = () => F.lockOut(1);
+  assert.equal(acceptedLockOf(t, F.program, F.NET, both).state, 'many', 'two outputs at the lock address both pay: the pages decide');
+  assert.equal(claimOf(t, F.program, F.NET, both).claim, null);
+  const one = (lock) => (lock.txid === F.LOCK_TXID ? F.lockOut(1) : { missing: true });
+  const r = claimOf(t, F.program, F.NET, one);
+  assert.equal(r.state, 'one');
+  assert.equal(r.lock.txid, F.LOCK_TXID, 'the one that pays, not the first signed claim posted');
+  assert.equal(r.claim.txid, F.LOCK_TXID);
+  assert.equal(acceptedLockOf(t, F.program, F.NET, (lock) => (lock.txid === F.LOCK_TXID ? F.lockOut(1) : undefined)).state, 'unread', 'one candidate not read yet');
+  assert.equal(acceptedLockOf(t, F.program, F.NET, () => ({ missing: true })).state, 'none');
 });
