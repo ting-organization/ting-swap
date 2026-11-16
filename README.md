@@ -4,7 +4,8 @@ Trade DLR on [Ting](https://github.com/ting-organization/ting) for LTC on Liteco
 with nobody sending first. The buyer locks the LTC on Litecoin under the hash of a
 secret only their page knows; the seller's page checks the lock and the seller locks
 the DLR on Ting for that buyer under the same hash. The buyer's page claims the DLR,
-which reveals the secret, and the seller's page uses it to claim the LTC. If anything
+which reveals the secret, and with it the LTC claim the seller signed as they accepted
+goes out, sent by the buyer's page or by anyone else who has seen the secret. If anything
 stalls, each side gets its coins back after a deadline. No server sits in between,
 and nobody holds anyone's coins: a program on Ting and a script on Litecoin do.
 
@@ -38,12 +39,13 @@ page replaced it.
 |---|---|---|
 | List | Seller, in Ting ID | The DLR go into the program, with the LTC wanted, the seller's Litecoin key for this trade, and the network fee the buyer's claim will pay |
 | Lock | Buyer | Pays the LTC from their own Litecoin wallet to an address only this trade uses; their page posts the take on Ting by itself, with no signature and no fee |
-| Accept | Seller, in Ting ID | Once their page has checked the lock on Litecoin, the DLR are held for that buyer for the lock window |
+| Accept | Seller, in Ting ID | Once their page has checked the lock on Litecoin, the DLR are held for that buyer for the lock window. Just before, their page posts on Ting the LTC claim it signed to the seller's address |
 | Claim the DLR | Buyer's page, by itself | Reveals the secret; the DLR go to the buyer, less the listing's fee |
-| Claim the LTC | Seller's page, by itself | Uses the secret to take the LTC to the seller's address |
+| Claim the LTC | Buyer's page, a watchtower or the seller's page, by itself | Finishes the seller's signed claim with the secret: the LTC go to the seller's address, and nowhere else |
 
 The seller's deadline on Ting always ends at least 6 hours before the buyer's lock on
-Litecoin does, so the seller has time to claim after the secret appears. A seller who
+Litecoin does, so the LTC can be claimed after the secret appears: the buyer's page sends
+the claim at once, and the seller's page does when it is open. A seller who
 accepts one buyer's lock, or withdraws the listing, has their page release every other
 lock at once, so that those buyers take their LTC back without waiting.
 

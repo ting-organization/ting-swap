@@ -79,6 +79,13 @@ const REORG_WINDOW = 100;
 const MAX_FEE_RATE = 1000;
 /** An LTC claim waiting longer than this for a block gets a warning. */
 const SLOW_CLAIM = 1800;
+/**
+ * The least litoshi per vbyte of the claim the seller's page signs ahead at an
+ * accept, which pays twice the rate of the moment if more: it may go out days
+ * later, and nobody can raise its fee then. About 170 vbytes, so a few
+ * thousand litoshi.
+ */
+const SIGNED_CLAIM_RATE = 10;
 /** Outputs of takes that matter for no claim, read at most this many per round, so that free takes cannot flood the explorer. */
 const OTHER_READS = 8;
 /** An output Litecoin did not have, read again after this long; one that pays another script never again. */
@@ -501,10 +508,14 @@ function tradeOf(id) {
   const open = app.listings.get(id) ?? null;
   const terms = open ?? (listed && { ...listed, listedAt: listed.time });
   const releases = [];
+  const signedClaims = [];
   for (const e of evs.filter((x) => x.kind === 'released')) {
     try {
       releases.push({ ...e, release: L.decodeRelease(e.data) });
     } catch { /* not a Litecoin release */ }
+    try {
+      signedClaims.push({ ...e, claim: L.decodeSignedClaim(e.data) });
+    } catch { /* not a signed claim */ }
   }
   return {
     id, open, listed, terms,
@@ -514,6 +525,7 @@ function tradeOf(id) {
     refunded: evs.find((e) => e.kind === 'refunded') ?? null,
     withdrawn: evs.find((e) => e.kind === 'withdrawn') ?? null,
     releases,
+    signedClaims,
     seller: mine(id, 'seller'),
     buyer: mine(id, 'buyer'),
   };
@@ -578,6 +590,29 @@ function releaseOf(d, take) {
       releaseChecks.set(key, ok);
     }
     if (releaseChecks.get(key)) return r;
+  }
+  return null;
+}
+
+/**
+ * The seller's signed claim of a lock (`lockScript`'s) whose output `out`
+ * Litecoin has: the first posted for that output whose signature is the
+ * listing key's over the claim it names, checked against the rebuilt script
+ * and the output's value. Anyone can post release data: one that does not
+ * verify is no signed claim. Null without one.
+ */
+function signedClaimOf(d, lock, out) {
+  for (const s of d.signedClaims) {
+    if (s.claim.txid !== lock.txid || s.claim.vout !== lock.vout) continue;
+    const key = `${hex(s.data)}|${hex(lock.script)}|${out.value}`;
+    if (!releaseChecks.has(key)) {
+      let ok = false;
+      try {
+        ok = L.verifyClaimSignature({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, out: s.claim.out, signature: s.claim.signature });
+      } catch { /* not a signature */ }
+      releaseChecks.set(key, ok);
+    }
+    if (releaseChecks.get(key)) return s;
   }
   return null;
 }
@@ -1088,13 +1123,50 @@ function refundable(d, t) {
   return (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed && outKey(u) !== key);
 }
 
-/** The buyer's Litecoin release or refund, sent again while the explorer does not know it: one an explorer lost. */
+/**
+ * Once this buyer's claim is on Ting, sends the seller's signed claim of the
+ * accepted lock, finished with this trade's secret: the seller agreed to it at
+ * the accept, and it pays only their address. Never before the claim is on
+ * Ting, which would hand over the LTC before the DLR. Sent once; resendLtc
+ * sends it again while the explorer does not know it.
+ */
+async function sendSellerClaim(d, t, take) {
+  if (!d.claimed || t.sellerClaim || !matchesAccept(take, d.accepted)) return;
+  const lock = lockScript(d.terms, take);
+  const out = lock && outOf(lock.txid, lock.vout);
+  if (!out || out.missing || out.spent || out.script !== hex(lock.scriptPubKey)) return;
+  const ahead = signedClaimOf(d, lock, out);
+  if (!ahead) return;
+  await once(`seller-claim:${t.n}`, async () => {
+    let tx;
+    try {
+      tx = L.finishClaim({
+        txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, out: ahead.claim.out, signature: ahead.claim.signature,
+        secret: K.secretAt(K.seed(), t.n),
+      });
+    } catch {
+      return; // signedClaimOf checked it: nothing this page can send
+    }
+    let error = null;
+    try {
+      await broadcast(tx.hex);
+    } catch (e) {
+      error = e.message;
+    }
+    update(t, { sellerClaim: { txid: tx.txid, hex: tx.hex, at: now(), error } });
+  });
+}
+
+/** The buyer's Litecoin release or refund, and the seller's claim it sent, sent again while the explorer does not know it: one an explorer lost. */
 async function resendLtc(d, t) {
   const claimed = claimedLock(d, t);
-  for (const sent of [t.releaseTx, ...Object.values(t.refundTxs ?? {})]) {
+  const claimedOut = claimed && outOf(claimed.txid, claimed.vout);
+  for (const sent of [t.releaseTx, t.sellerClaim, ...Object.values(t.refundTxs ?? {})]) {
     if (!sent?.hex) continue;
     // A refund that spends the claimed lock would take the seller's LTC: it is never sent again.
     if (claimed && sent.covers?.includes(outKey(claimed))) continue;
+    // The seller's claim is done with once the lock is spent, by it or by another claim of theirs.
+    if (sent === t.sellerClaim && claimedOut?.spent) continue;
     const s = app.lt.txs.get(sent.txid);
     if (!s || s.found || now() - sent.at < RESEND_AFTER) continue;
     await once(`resend:${sent.txid}`, async () => {
@@ -1106,6 +1178,7 @@ async function resendLtc(d, t) {
       }
       // The time is noted whatever came of it, so that it is tried again later, not in every read.
       if (t.releaseTx?.txid === sent.txid) update(t, { releaseTx: { ...t.releaseTx, at: now(), error } });
+      else if (t.sellerClaim?.txid === sent.txid) update(t, { sellerClaim: { ...t.sellerClaim, at: now(), error } });
       else update(t, { refundTxs: { ...t.refundTxs, [sent.txid]: { ...sent, at: now(), error } } });
     });
   }
@@ -1159,6 +1232,8 @@ async function autoBuyer(d, t, { ltc = true, ting = true } = {}) {
     if (!t.acceptProblem) update(t, { acceptProblem: 'The accept names your hash but another account or T1 than your lock: the page will not claim.' });
     return;
   }
+  // The claim on Ting made the secret public: the seller's signed claim goes out with it, so the seller need not be there.
+  if (ltc && d.claimed) await sendSellerClaim(d, t, take);
   if (depthOf(acc.height) < app.tconfs) return;
   if (d.claimed && depthOf(d.claimed.height) >= app.tconfs) return;
   if (t.claimTx) {
@@ -1239,7 +1314,14 @@ const claimsOf = (t, key) => Object.values(t.ltcClaims ?? {}).filter((s) => (s.k
 async function autoSeller(d, t, { ting = true } = {}) {
   // Releases are sent on Ting: not while Ting cannot be read. The claim below needs only the claim already seen.
   if (ting && (d.accepted || d.withdrawn)) await releaseOthers(d, t);
-  if (!d.claimed) return;
+  if (!d.claimed) {
+    // Until the buyer claims, the accepted lock's signed claim stays on Ting, for whoever sends it then.
+    if (ting && d.accepted && t.payout && now() <= d.accepted.deadline) {
+      const c = acceptedLock(d, t);
+      if (c && !c.out.spent) await keepSignedClaim(d, t, c);
+    }
+    return;
+  }
   const c = acceptedLock(d, t);
   if (!c) return;
   if (c.out.spent) {
@@ -1247,6 +1329,26 @@ async function autoSeller(d, t, { ting = true } = {}) {
     return;
   }
   const sent = claimsOf(t, c.key);
+  // The claim signed at the accept, finished with the secret now public: the same transaction the buyer's page or a watchtower sends.
+  const ahead = sent.find((s) => s.signed && !s.hex && !s.dead);
+  if (ahead) {
+    await once(`ltc-claim:${c.key}`, async () => {
+      let tx = null;
+      try {
+        const posted = L.decodeSignedClaim(unhex(ahead.signed.data));
+        tx = L.finishClaim({ txid: c.txid, vout: c.vout, value: c.out.value, htlc: c.htlc, out: posted.out, signature: posted.signature, secret: d.claimed.secret });
+        update(t, { ltcClaims: { ...t.ltcClaims, [ahead.txid]: { ...ahead, hex: tx.hex, at: now(), first: now() } } });
+        await broadcast(tx.hex);
+        update(t, { ltcClaimError: null });
+        toast('Your page sent your signed LTC claim.', 'success', 8000);
+      } catch (e) {
+        // One that cannot be finished, or that Litecoin refuses outright, is given up: the page claims anew.
+        const dead = !tx || e.refused ? e.message : null;
+        update(t, { ltcClaims: { ...t.ltcClaims, [ahead.txid]: { ...t.ltcClaims[ahead.txid], at: now(), dead } }, ltcClaimError: e.message });
+      }
+    });
+    return;
+  }
   for (const s of sent) {
     if (s.dead || !s.hex) continue;
     const st = app.lt.txs.get(s.txid);
@@ -1315,6 +1417,7 @@ function needsOf(d, t) {
   if (t?.role === 'buyer' && t.address) first.addresses.push(t.address);
   for (const s of Object.values(t?.ltcClaims ?? {})) if (s.txid) first.txs.push(s.txid);
   if (t?.releaseTx?.txid) first.txs.push(t.releaseTx.txid);
+  if (t?.sellerClaim?.txid) first.txs.push(t.sellerClaim.txid);
   for (const r of Object.values(t?.refundTxs ?? {})) if (r.txid) first.txs.push(r.txid);
   return { first, followed, rest };
 }
@@ -1968,9 +2071,13 @@ function sellerPanel(d, t, form) {
         <div class="row"><button class="primary large" data-refund-dlr>${icon('undo')} Get your DLR back</button></div>
         ${nextLine('The refund needs no signature: the page sends it, and it is done in a block, a few seconds here.')}${others ? `<h3>Other buyers’ locks</h3>${others}` : ''}`, 'act');
     }
+    const main = acceptedLock(d, t);
+    const ahead = main && signedClaimOf(d, main, main.out);
     return panel('Waiting for the buyer to claim', `<p>${dlr(acc.amount)} are held for the buyer until ${when(acc.deadline)}.</p>
-      ${waiting('Their page claims by itself. Then yours claims the LTC to your address.')}
-      ${nextLine(`Keep this page open, or come back before ${esc(localTime(acc.t1))}.`)}
+      ${waiting('Their page claims by itself. Then the LTC is claimed to your address.')}
+      ${ahead ? `<p class="hint">Your signed LTC claim is on Ting, block ${ahead.height}: once the buyer claims, their page or a watchtower can send it to <code>${esc(t.payout)}</code> for you. It pays only that address.</p>`
+        : t.signedClaimError ? `<div class="callout bad">${icon('alert')}<div><b>Your signed LTC claim is not on Ting yet:</b> ${esc(t.signedClaimError)}. Your page tries again.</div></div>` : ''}
+      ${nextLine(ahead ? `If nobody sends it, your page does when you come back: come back before ${esc(localTime(acc.t1))} to be sure.` : `Keep this page open, or come back before ${esc(localTime(acc.t1))}.`)}
       ${payoutField(t, form)}
       <div class="row">${shareButton(d)}</div>
       ${others ? `<h3>Other buyers’ locks</h3><p class="hint">Your page releases them by itself, so that those buyers take their LTC back now.</p>${t.releaseError ? `<div class="callout bad">${icon('alert')}<div><b>A release did not go out:</b> ${esc(t.releaseError)}. Your page tries again.</div></div>` : ''}${others}` : ''}`, 'wait');
@@ -1994,8 +2101,9 @@ function sellerPanel(d, t, form) {
       ${withdraw}`, 'wait');
   }
   return panel('A buyer locked LTC: check and accept', `<p>Your page checked each lock on Litecoin.</p>
+    ${payoutField(t, form)}
     ${rows}
-    ${nextLine(`Accepting holds your ${dlr(l.amount)} for that buyer for ${span(l.window)}.`)}
+    ${nextLine(`Accepting holds your ${dlr(l.amount)} for that buyer for ${span(l.window)}. As you accept, your page signs the claim of the LTC to your address and posts it on Ting, so that it can be sent for you once the buyer claims.`)}
     ${share}${withdraw}`, 'act');
 }
 
@@ -2079,7 +2187,7 @@ function sellerClaimedPanel(d, t, form) {
   if (main.out.spent && main.out.spenderConfirmed) {
     const done = claims.filter((c) => c.txid === main.out.spender);
     const got = done.reduce((s, c) => s + c.value, 0);
-    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your page claimed ${ltc(got)}${usd(got)} to <code>${esc(t.payout)}</code> (after a Litecoin fee of ${ltcText(done.reduce((s, c) => s + c.fee, 0))} LTC).</p>
+    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your LTC claim paid ${ltc(got)}${usd(got)} to <code>${esc(t.payout)}</code> (after a Litecoin fee of ${ltcText(done.reduce((s, c) => s + c.fee, 0))} LTC).</p>
       <dl class="lines mini-lines">${lines}</dl>
       <p class="hint">Your page claimed the lock you accepted, and only that: anything else at its address stays the buyer’s.</p>
       ${app.ltcWallet ? `<p class="hint">In this test setup, see it in the <a href="${esc(app.ltcWallet)}" target="_blank" rel="noopener">Litecoin regtest wallet</a> (Alice).</p>` : ''}
@@ -2546,9 +2654,18 @@ async function accept(id, index) {
   if (app.lt.error || app.lt.failed.has(outKey(take.lockOf))) throw new Error(`Cannot check the lock on Litecoin: ${app.lt.error ?? app.lt.failed.get(outKey(take.lockOf))}`);
   const c = checkTake(listing, take);
   if (c.state !== 'ok') throw new Error(`Not accepting: ${c.words}.`);
+  if (!d.seller.payout) throw new Error('Enter your Litecoin payout address first: your page signs the claim of your LTC to it as you accept.');
   // Another accept link may still be approved: say what a second one means before showing it.
   const others = Object.keys(d.seller.accepting ?? {}).filter((k) => k !== outKey(take.lockOf) && d.takes.some((x) => x.lockOf && outKey(x.lockOf) === k));
   if (others.length && !(await askSecondLink(d, others))) throw new Quiet();
+  // The claim, signed now, goes on Ting before the accept: once the buyer claims, it can be sent without this page.
+  if (!signedClaimSent(d.seller, outKey(take.lockOf))) {
+    try {
+      await postSignedClaim(d, take);
+    } catch (e) {
+      throw new Error(`Not accepting yet: your page could not post your signed LTC claim on Ting (${e.message}). Try again.`);
+    }
+  }
   update(d.seller, { accepting: { ...(d.seller.accepting ?? {}), [outKey(take.lockOf)]: { at: now(), index } } });
   await perform({
     call: H.acceptCall(listing, take), feeCoin: app.coin, label: `Accept the lock for listing #${id}`,
@@ -2584,6 +2701,68 @@ async function sendRelease(d, take, t = d.seller) {
   const tx = await sendOwn(H.releaseInput(d.id, L.encodeRelease({ txid: lock.txid, vout: lock.vout, signature })));
   update(t, { releases: { ...(t.releases ?? {}), [outKey(lock)]: { id: tx, at: now() } } });
   return tx;
+}
+
+/** The claim this browser signed ahead for a lock (by its output's key), if it did. */
+const signedClaimSent = (t, key) => Object.values(t?.ltcClaims ?? {}).find((s) => s.signed && s.key === key) ?? null;
+
+/**
+ * Signs the claim of a lock ahead, to the payout address, and posts it on Ting
+ * as release data, version 2 (HTLC.md, "Spending it"). Once the buyer's claim
+ * makes the secret public, anyone can finish and send it, the buyer's page or
+ * a watchtower: it pays only the payout address, so the seller need not be
+ * there. It is kept among the trade's LTC claims, its txid known before the
+ * secret is in, so that whoever sends it, this page knows the spend as its
+ * own. Returns the Ting transaction's id, or throws saying why not.
+ */
+async function postSignedClaim(d, take, t = d.seller) {
+  if (!t) throw new Error('this browser did not make this listing');
+  if (!t.payout) throw new Error('no payout address yet');
+  const lock = lockScript(d.terms, take);
+  if (!lock) throw new Error('that take names no lock this page can read');
+  const out = outOf(lock.txid, lock.vout);
+  if (!out || out.missing || out.script !== hex(lock.scriptPubKey)) throw new Error('there is no such lock on Litecoin');
+  if (out.spent) throw new Error('that lock is already spent');
+  const rate = Math.min(MAX_FEE_RATE, Math.max(SIGNED_CLAIM_RATE, 2 * (await feeRate())));
+  const signed = L.signClaim({ txid: lock.txid, vout: lock.vout, value: out.value, htlc: lock.htlc, key: K.keyAt(K.seed(), t.n), to: t.payout, feeRate: rate, network: app.net });
+  const data = L.encodeSignedClaim(signed);
+  const id = await sendOwn(H.releaseInput(d.id, data));
+  update(t, {
+    ltcClaims: {
+      ...(t.ltcClaims ?? {}),
+      [signed.claim]: {
+        txid: signed.claim, fee: signed.fee, value: signed.out.value, rate, key: outKey(lock), listing: d.id,
+        signed: { id, data: hex(data), posted: now() },
+      },
+    },
+  });
+  return id;
+}
+
+/**
+ * Posts the signed claim of the accepted lock while the buyer has not claimed:
+ * once, if this browser has none for it (a trade restored from a backup code,
+ * whose payout address came later, or an accept made before signed claims),
+ * and again, the same data, if the node no longer knows the posting and the
+ * claim is not on Ting.
+ */
+async function keepSignedClaim(d, t, c) {
+  const own = signedClaimSent(t, c.key);
+  if (!own) {
+    await once(`signed-claim:${c.key}`, () => postSignedClaim(d, acceptedTake(d, t), t).then(() => update(t, { signedClaimError: null })).catch((e) => update(t, { signedClaimError: e.message })));
+    return;
+  }
+  if (signedClaimOf(d, c, c.out) || now() - (own.signed.posted ?? 0) < RESEND_AFTER) return;
+  const s = await tingTx(own.signed.id).catch(() => null);
+  if (s?.state !== 'missing') return;
+  await once(`signed-claim:${c.key}`, async () => {
+    try {
+      const id = await sendOwn(H.releaseInput(d.id, unhex(own.signed.data)));
+      update(t, { ltcClaims: { ...t.ltcClaims, [own.txid]: { ...own, signed: { ...own.signed, id, posted: now() } } }, signedClaimError: null });
+    } catch (e) {
+      update(t, { signedClaimError: e.message });
+    }
+  });
 }
 
 /** The seller's Decline and release: one lock, followed into a block. */

@@ -175,6 +175,12 @@ try { await checkTake(listing, copied); fail('a copied take with another account
   ok('a copy of the take naming another account is refused: its address holds nothing');
 }
 
+const aliceAddr = await address('alice');
+// Alice's page signs the claim of the lock ahead, to her address, and posts it on Ting as release data version 2.
+const ahead = L.signClaim({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, key: ltcKey, to: aliceAddr, feeRate: 10, network: NET });
+await own(H.releaseInput(listing.id, L.encodeSignedClaim(ahead)));
+ok(`Alice's page posted her signed claim on Ting before accepting: ${L.encodeSignedClaim(ahead).length} bytes, claim txid ${ahead.claim}`);
+
 let r = await chain.operate(alice, program, H.acceptCall(listing, take));
 if (r.status !== 0) fail(`accept refused: ${r.reason}`);
 const lock = await lockOf(listing.id);
@@ -191,11 +197,17 @@ const got = (await balance(bob)) - before;
 if (got !== 10n * DLR - listing.fee) fail(`Bob got ${got}`);
 ok(`Bob's page claimed with the secret: Bob got ${Number(got) / 1e8} DLR, the claim paid the listing's fee of ${Number(listing.fee) / 1e8} DLR`);
 
-const claimed = (await events(startHeight)).find((e) => e.kind === 'claimed' && e.id === listing.id);
-const aliceAddr = await address('alice');
+const evs = await events(startHeight);
+const claimed = evs.find((e) => e.kind === 'claimed' && e.id === listing.id);
 const aliceBefore = await walletBalance('alice');
-// The seller's page claims the accepted lock, and only that: the dust beside it stays the buyer's.
-const claim = L.claimTx({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 2, network: NET });
+// Anyone who read the claim on Ting finishes Alice's signed claim, as read back from Ting, with
+// no key of hers: Bob's page, a watchtower. It claims the accepted lock, and only that: the dust
+// beside it stays the buyer's.
+const posted = evs.filter((e) => e.kind === 'released' && e.id === listing.id).map((e) => { try { return L.decodeSignedClaim(e.data); } catch { return null; } }).find(Boolean);
+if (!posted || !L.verifyClaimSignature({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, out: posted.out, signature: posted.signature })) fail('no signed claim of Alice\'s on Ting');
+const claim = L.finishClaim({ txid: posted.txid, vout: posted.vout, value: paid.value, htlc: checked.htlc, out: posted.out, signature: posted.signature, secret: claimed.secret });
+if (claim.txid !== ahead.claim) fail('the finished claim is not the one Alice signed');
+if (claim.hex !== L.claimTx({ txid: paid.txid, vout: paid.vout, value: paid.value, htlc: checked.htlc, secret: claimed.secret, key: ltcKey, to: aliceAddr, feeRate: 10, network: NET }).hex) fail('the finished claim is not the claim Alice\'s key makes');
 await broadcast(claim.hex);
 await mine(1);
 const claimStatus = await ltc(`/api/tx/${claim.txid}/status`);
@@ -203,7 +215,7 @@ if (!claimStatus.confirmed) fail('the LTC claim did not confirm');
 if (L.parseTx(claim.hex).inputs.length !== 1) fail('the claim spends more than the accepted lock');
 if ((await ltc(`/api/tx/${paid.txid}/outspend/${paid.vout}`)).txid !== claim.txid) fail('the accepted lock is not spent by the claim');
 if ((await ltc(`/api/tx/${dust.txid}/outspend/${dust.vout}`)).spent) fail('the dust beside the lock was spent');
-ok(`Alice's page read the secret on Ting and claimed the accepted lock alone: ${claim.txid} (fee ${claim.fee} litoshi, ${claim.vsize} vB), mined; the dust beside it is unspent, the buyer's to refund after T1`);
+ok(`Alice's signed claim, finished with the secret from Ting and sent with no key of hers, claimed the accepted lock alone: ${claim.txid} (fee ${claim.fee} litoshi, ${claim.vsize} vB), mined; the dust beside it is unspent, the buyer's to refund after T1`);
 ok(`Alice's Litecoin wallet: ${aliceBefore} → ${await walletBalance('alice')} LTC`);
 
 step('Trade 2: a take Alice declines, released at once');

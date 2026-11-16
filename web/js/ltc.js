@@ -1,7 +1,8 @@
 // Litecoin, as the page needs it for the other side of a swap (HTLC.md, "The
 // Litecoin side"): addresses, the lock's witness script and its P2WSH
-// address, the take's lock bytes and the release data, and the transactions
-// that spend the lock, built and signed here.
+// address, the take's lock bytes and the release data (a release, or the
+// seller's signed claim), and the transactions that spend the lock, built and
+// signed here.
 //
 // Amounts are litoshi (10⁻⁸ LTC) as Numbers: all 84,000,000 LTC fit a double
 // exactly. A txid is 64 hex digits in the order explorers show it. Byte
@@ -505,6 +506,38 @@ export function decodeRelease(bytes) {
   return release;
 }
 
+function checkClaimOut(out) {
+  if (!scriptType(out?.script)) throw new Error('a claim to no standard output script');
+  if (!Number.isSafeInteger(out.value) || out.value <= 0 || out.value > MAX_MONEY) throw new Error(`a claim's output of ${out.value}, not an amount of litoshi`);
+  return out;
+}
+
+/**
+ * The seller's signed claim as release data: `02 ‖ txid(32, as explorers show
+ * it) ‖ u32 vout ‖ u64 value ‖ Bytes(script) ‖ Bytes(signature)`, the lock,
+ * the claim's one output, and the seller's SIGHASH_ALL signature with its
+ * sighash byte (signClaim).
+ */
+export function encodeSignedClaim({ txid, vout, out, signature }) {
+  if (!(signature instanceof Uint8Array) || !signature.length) throw new Error('no signature');
+  checkClaimOut(out);
+  return concat(Uint8Array.of(2), txidBytes(txid), u32(checkVout(vout)), u64(out.value), framed(out.script), framed(signature));
+}
+
+/** `{ txid, vout, out: { value, script }, signature }` of release data; throws unless it is exactly a signed claim, version 2. */
+export function decodeSignedClaim(bytes) {
+  const r = new Reader(bytes);
+  const version = r.u8();
+  if (version !== 2) throw new Error(`release data of version ${version}, not 2`);
+  const txid = hex(r.take(32));
+  const vout = r.u32();
+  const value = r.u64();
+  const claim = { txid, vout, out: { value: value > BigInt(MAX_MONEY) ? -1 : Number(value), script: r.bytes().slice() }, signature: r.bytes().slice() };
+  r.end();
+  checkClaimOut(claim.out);
+  return claim;
+}
+
 // ---- Transactions ----------------------------------------------------------
 
 /** Litecoin's 84,000,000 LTC in litoshi. */
@@ -702,17 +735,81 @@ const finish = ({ tx, fee }) => ({ hex: hex(serializeTx(tx)), txid: txid(tx), fe
  * `sig(seller) ‖ secret ‖ 01 ‖ script`, SIGHASH_ALL, nLockTime 0 and a final
  * nSequence (no replace-by-fee, so a late refund cannot replace it in
  * mempools). Takes `{ txid, vout, value, htlc, secret, key, to, feeRate,
- * network }`, `key` the seller's; gives `{ hex, txid, fee, vsize, tx }`.
+ * network }`, `key` the seller's; gives `{ hex, txid, fee, vsize, tx }`. It is
+ * signClaim and finishClaim in a row.
  */
 export function claimTx({ secret, key, ...lock }) {
   htlcScript(lock.htlc);
   checkSigner(key, lock.htlc.seller, 'seller');
+  checkSecret(secret, lock.htlc);
+  const { out, signature } = signClaim({ ...lock, key });
+  return finishClaim({ txid: lock.txid, vout: lock.vout, value: lock.value, htlc: lock.htlc, out, signature, secret });
+}
+
+function checkSecret(secret, htlc) {
   checkBytes(secret, 32, 'the secret');
-  if (!equal(sha256(secret), lock.htlc.hash)) throw new Error("the secret does not hash to the lock's hash");
-  const spent = spend(lock, { sequence: FINAL, locktime: 0, stack: (sig) => [sig, secret, Uint8Array.of(1)] });
-  const input = spent.tx.inputs[0];
-  input.witness[0] = signed(key, sighash(spent.tx, 0, spent.script, spent.amount, SIGHASH_ALL), SIGHASH_ALL);
-  return finish(spent);
+  if (!equal(sha256(secret), htlc.hash)) throw new Error("the secret does not hash to the lock's hash");
+}
+
+/** The claim without its witness: the lock `txid:vout` its one input with a final nSequence, `out` its one output, version 2, nLockTime 0. */
+function claimShell({ txid: lockTxid, vout, out }) {
+  return {
+    version: 2,
+    inputs: [{ txid: hex(txidBytes(lockTxid)), vout: checkVout(vout), scriptSig: EMPTY, sequence: FINAL, witness: [] }],
+    outputs: [{ value: out.value, script: out.script.slice() }],
+    locktime: 0,
+  };
+}
+
+/**
+ * The seller's claim, signed before anyone but the buyer knows the secret:
+ * BIP 143's digest covers the transaction, not its witness, so the secret goes
+ * in later (finishClaim) and makes the transaction claimTx makes. Whoever
+ * adds the secret, and in whichever branch of the script the signature is
+ * used, it signs only this transaction: it pays only `to`. Takes `{ txid,
+ * vout, value, htlc, key, to, feeRate, network }`, `key` the seller's; gives
+ * `{ txid, vout, out: { value, script }, signature, fee, claim }`, `claim`
+ * the claim's own txid, which its witness does not change.
+ */
+export function signClaim({ key, ...lock }) {
+  htlcScript(lock.htlc);
+  checkSigner(key, lock.htlc.seller, 'seller');
+  const spent = spend(lock, { sequence: FINAL, locktime: 0, stack: (sig) => [sig, new Uint8Array(32), Uint8Array.of(1)] });
+  const signature = signed(key, sighash(spent.tx, 0, spent.script, spent.amount, SIGHASH_ALL), SIGHASH_ALL);
+  const [input] = spent.tx.inputs;
+  const out = { value: spent.tx.outputs[0].value, script: spent.tx.outputs[0].script };
+  return { txid: input.txid, vout: input.vout, out, signature, fee: spent.fee, claim: txid(spent.tx) };
+}
+
+/** Whether `signature` is the seller's SIGHASH_ALL signature of the claim of the lock `txid:vout` of `value` into `out`, low S and all. */
+export function verifyClaimSignature({ txid: lockTxid, vout, value, htlc, out, signature }) {
+  const script = htlcScript(htlc);
+  const amount = checkAmount(value);
+  try {
+    checkClaimOut(out);
+  } catch {
+    return false;
+  }
+  if (out.value >= amount) return false;
+  if (!(signature instanceof Uint8Array) || signature.length < 2 || signature[signature.length - 1] !== SIGHASH_ALL) return false;
+  const digest = sighash(claimShell({ txid: lockTxid, vout, out }), 0, script, amount, SIGHASH_ALL);
+  return secp.verify(signature.subarray(0, -1), digest, htlc.seller);
+}
+
+/**
+ * The seller's signed claim with the secret: witness `sig(seller) ‖ secret ‖
+ * 01 ‖ script`, the transaction signClaim signed, ready to send. Anyone who
+ * knows the secret can make it, and it pays only `out`. Checks the secret and
+ * the signature first. Takes `{ txid, vout, value, htlc, out, signature,
+ * secret }`; gives `{ hex, txid, fee, vsize, tx }`.
+ */
+export function finishClaim({ txid: lockTxid, vout, value, htlc, out, signature, secret }) {
+  const script = htlcScript(htlc);
+  checkSecret(secret, htlc);
+  if (!verifyClaimSignature({ txid: lockTxid, vout, value, htlc, out, signature })) throw new Error("the seller's signature does not sign this claim");
+  const tx = claimShell({ txid: lockTxid, vout, out });
+  tx.inputs[0].witness = [signature.slice(), secret.slice(), Uint8Array.of(1), script];
+  return finish({ tx, fee: checkAmount(value) - out.value });
 }
 
 /**
