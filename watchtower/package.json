@@ -1,0 +1,13 @@
+{
+  "name": "ting-swap-watchtower",
+  "private": true,
+  "type": "module",
+  "description": "Discord feed and reminders for Ting Swap's Litecoin page, and the sender of signed LTC claims and DLR refunds",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "dry-run": "node src/main.mjs --dry-run",
+    "register": "node src/main.mjs register",
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}

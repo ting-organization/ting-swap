@@ -7,3 +7,5 @@ htlc/target/
 .claude/
 .devltc/
 .htlc-dev.json
+watchtower-state.json
+watchtower-state.json.tmp

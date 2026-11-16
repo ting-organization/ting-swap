@@ -483,6 +483,19 @@ computer.
 - **Explorer.** The page reads Litecoin from an Esplora-style API: litecoinspace.org, or
   `scripts/ltc-dev.mjs` on a regtest chain.
 
+## The watchtower
+
+`watchtower/` ([its README](watchtower/README.md)) is a service beside the page that
+reads the same two chains the same way and holds no key. It sends two things, both of
+which anyone may send: the seller's signed claim, finished with the secret once the
+claimed event is on Ting (checked as the pages check it, and sent again while the
+explorer does not know it, until the lock is spent), and the refund on Ting of an
+accepted listing whose deadline has passed by the clock and by Ting's tip, with the lock
+record still there. Going by the clock as well as the tip, it never helps a block stamped
+ahead of time. It also keeps a Discord feed of the listings and reminds, by direct
+message, those who watch a listing at the steps that need them. Nothing depends on it:
+the pages do every step themselves, and its reminders say so.
+
 ## Production
 
 The program runs on the production network as
