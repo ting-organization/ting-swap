@@ -14,7 +14,7 @@ it is, trades real DLR for real LTC on Litecoin mainnet: start with small amount
 Opened with a test setup's address, it runs on the Ting development chain and Litecoin
 regtest instead; see *A test setup* below to run a whole trade on your computer.
 
-It is three pieces:
+It is three pieces, and a helper:
 
 - **The HTLC program** (`htlc/`, built to `htlc.wasm`): listings, locks, claims and
   refunds on Ting. It never sees Litecoin. [HTLC.md](HTLC.md) states its rules, the
@@ -26,6 +26,11 @@ It is three pieces:
   build step and no third-party code. It reads Ting from a node and Litecoin from an
   Esplora-style explorer, keeps each trade's Litecoin key and secret in the browser,
   and hands each Ting action that needs a signature to Ting ID as a TCR-1 call link.
+- **The watchtower** (`watchtower/`, [its README](watchtower/README.md)): a Node.js
+  service with no key and no dependencies. It keeps a Discord feed of the listings,
+  reminds those who watch one at the steps that need them, finishes the seller's signed
+  LTC claim once the buyer has claimed, and sends DLR refunds after a deadline. Nothing
+  depends on it.
 
 The repository also holds **the on-chain swap program** (`program/`, `swap.wasm`,
 [SPEC.md](SPEC.md)): coin-for-coin listings on Ting itself, deployed on the production
