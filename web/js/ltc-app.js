@@ -903,11 +903,11 @@ function device() {
 }
 
 /**
- * Hands an operation to Ting ID as a call link: the dialog with the ways to
- * open it that suit this device (the app, Ting ID Web, the QR code) and the
- * link itself. The page watches the program's events until it is done, then
- * calls `done(true, executed)`; `done(false)` when the dialog is closed first
- * or the call fails.
+ * Hands an operation to Ting ID as a call link: the dialog with both wallets
+ * that open it, Ting ID and Ting ID Web, each with its icon, the QR code where
+ * it suits this device, and the link itself. The page watches the program's
+ * events until it is done, then calls `done(true, executed)`; `done(false)`
+ * when the dialog is closed first or the call fails.
  */
 async function perform({ call, pay, label, from, feeCoin, notes = '', done }) {
   const link = await callLink({
@@ -920,19 +920,22 @@ async function perform({ call, pay, label, from, feeCoin, notes = '', done }) {
   try { qr = qrSvg(link); } catch { /* too long for a QR code */ }
   const qrButton = qr ? `<button class="qr" aria-label="Show the QR code full screen">${qr}</button>` : '';
   const kind = device();
-  const toApp = `<a class="button primary" id="open-app" href="${esc(link)}" autofocus>${icon('key')} Open in Ting ID</a>`;
-  const toWeb = (primary) => (app.wallet ? `<a class="button${primary ? ' primary' : ''}" id="open-wallet" href="${esc(walletUrl(link))}" target="_blank" rel="noopener"${primary ? ' autofocus' : ''}>${icon(primary ? 'key' : 'external')} ${primary ? 'Open in Ting ID Web' : 'Ting ID Web'}</a>` : '');
-  const copyButton = '<button id="copy-call">Copy link</button>';
+  // Both wallets, always, the same on every device; the one that suits this device has the focus.
+  const focusApp = kind === 'android';
+  const focusWeb = kind === 'ios' || (kind === 'computer' && !qrButton);
+  const wallets = `<div class="open-with">
+      <div class="open-head"><span>Open with</span><button class="quiet" id="copy-call">${icon('copy')} Copy link</button></div>
+      <div class="apps">
+        <a class="app" id="open-app" href="${esc(link)}"${focusApp ? ' autofocus' : ''}>${MARKS.tingId}<span><b>Ting ID</b><small>The Android app</small></span></a>
+        ${app.wallet ? `<a class="app" id="open-wallet" href="${esc(walletUrl(link))}" target="_blank" rel="noopener"${focusWeb ? ' autofocus' : ''}>${MARKS.tingIdWeb}<span><b>Ting ID Web</b><small>In this browser</small></span>${icon('external')}</a>` : ''}
+      </div>
+    </div>`;
   // On a phone the code is for another device, so it folds away; on a computer it comes first, for the app on a phone.
   const folded = qrButton ? `<details class="owner tech"><summary>Show the QR code, for Ting ID on another phone</summary>${qrButton}</details>` : '';
-  const ways = {
-    android: `<p class="hint">Opens the Ting ID app. If your identity is in Ting ID Web instead, open it there.</p>
-      <div class="row">${toApp}${toWeb(false)}${copyButton}</div>${folded}`,
-    ios: `<p class="hint">Opens Ting ID Web, which signs with your passkey. Ting ID itself is an Android app: if your identity is there, scan the QR code with it.</p>
-      <div class="row">${toWeb(true)}${copyButton}</div>${folded}`,
-    computer: `<p class="hint">${qrButton ? 'Scan the code with the Ting ID app on your phone, or open it in Ting ID Web if your identity is set up there.' : 'Too long for a QR code: open it in Ting ID Web, or copy the link to the phone that has Ting ID.'}</p>
-      <div class="row">${toWeb(!qrButton)}${copyButton}</div>`,
-  };
+  const hint = kind !== 'computer' ? 'Open it in the wallet that holds your identity.'
+    : qrButton ? 'Scan the code with Ting ID on your phone, or open it below.'
+    : 'Too long for a QR code: open it below, or copy the link to the phone that has Ting ID.';
+  const ways = `<p class="hint">${hint}</p>${wallets}${kind === 'computer' ? '' : folded}`;
   $('.dialog-body', dialog).innerHTML = `<div class="eyebrow">Sign with Ting ID</div><h2>${esc(label)}</h2>
     <p class="call-sentence">${walletSentence(call.template, call.values, pay)}</p>
     ${notes}
@@ -940,7 +943,7 @@ async function perform({ call, pay, label, from, feeCoin, notes = '', done }) {
     <div class="call-pay ${kind}">
       ${kind === 'computer' ? qrButton : ''}
       <div class="pay-side">
-        ${ways[kind]}
+        ${ways}
         <p class="hint waiting" id="call-status"><span class="spinner" aria-hidden="true"></span> Waiting for you to approve it in Ting ID…</p>
       </div>
     </div>`;
@@ -3246,6 +3249,15 @@ function icon(name) {
   };
   return `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;
 }
+
+/**
+ * The wallets' own icons, as each draws it: Ting ID's (ting-id, assets/logo)
+ * and Ting ID Web's (ting-id-web, web/icon.svg).
+ */
+const MARKS = {
+  tingId: '<svg class="app-mark" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#4F46E5"/><g fill="#FFFFFF"><circle cx="512" cy="512" r="300" fill="none" stroke="#FFFFFF" stroke-width="76"/><rect x="382" y="368" width="260" height="84" rx="42"/><rect x="470" y="476" width="84" height="196" rx="42"/></g></svg>',
+  tingIdWeb: '<svg class="app-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#0b1220"/><circle cx="32" cy="32" r="17" fill="none" stroke="#a5a6ff" stroke-width="4"/><path d="M24 26h16M32 26v16" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/></svg>',
+};
 
 // ---- Theme -----------------------------------------------------------------
 

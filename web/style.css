@@ -400,6 +400,19 @@ dialog .close:hover { background: var(--hover); color: var(--text); border-color
 .pay-side details .qr { display: block; width: 200px; max-width: 100%; margin-top: 8px; }
 .pay-side .hint:first-child { margin-top: 0; }
 .pay-side .row { margin: 12px 0; }
+/* The wallets a call link opens in, both always, each with its own icon. */
+.open-with { margin: 12px 0; }
+.open-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 12.5px; font-weight: 500; color: var(--muted); }
+button.quiet { min-height: 0; padding: 3px 6px; font-size: 12.5px; color: var(--text-2); background: none; border-color: transparent; }
+button.quiet:hover { background: var(--hover); border-color: transparent; }
+button.quiet .icon { width: 14px; height: 14px; }
+.apps { display: grid; gap: 8px; }
+.app { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); text-decoration: none; transition: background-color .12s, border-color .12s; }
+.app:hover { background: var(--hover); border-color: var(--accent); text-decoration: none; }
+.app b { display: block; font-size: 14px; font-weight: 600; line-height: 1.3; }
+.app small { display: block; font-size: 12.5px; color: var(--muted); line-height: 1.3; }
+.app > .icon { margin-left: auto; width: 14px; height: 14px; color: var(--muted); align-self: flex-start; }
+.app-mark { flex: none; width: 34px; height: 34px; border-radius: 8px; box-shadow: 0 0 0 1px var(--border); }
 .waiting { display: flex; align-items: center; gap: 8px; }
 .waiting .spinner { width: 13px; height: 13px; border-width: 1.5px; }
 .qr { display: block; width: 100%; height: auto; min-height: 0; padding: 8px; background: #fff; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; }
