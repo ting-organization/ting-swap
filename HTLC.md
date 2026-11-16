@@ -393,8 +393,9 @@ computer.
   click. It accepts only with a payout address (a trade restored from a backup code asks
   for it again, or takes it from a signed claim of the lock already on Ting), since it
   signs the claim to it: at the click, before it shows the accept link, it posts that
-  lock's signed claim on Ting, unless one verifying is there already, and does not show
-  the link if it cannot. Until the buyer claims, it keeps one on Ting: it adopts one
+  lock's signed claim on Ting, unless one verifying is there already (and then says,
+  before the link, when that claim pays another address than this browser's), and does
+  not show the link if it cannot. Until the buyer claims, it keeps one on Ting: it adopts one
   verifying that is there, whichever browser with the backup code posted it, posts its
   own if there is none, and posts the same data again if the node lost the posting.
 - **Accepts and releases.** A release lets a buyer take the lock back; an accept holds
