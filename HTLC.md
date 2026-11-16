@@ -28,9 +28,9 @@ plain SHA-256. Errors are the exact ASCII bytes the program reverts with.
 | Offer | Seller | Ting | Pays the coins into the program; states the other chain, the amount wanted there, the seller's key there, and the lock window |
 | Lock | Buyer | Litecoin | Pays the wanted amount to a script: the seller with the secret, or the buyer after T1 |
 | Take | Buyer's page | Ting | Posts the hash, T1, the buyer's Ting account and where the lock is. Anyone may post; nothing is stored |
-| Accept | Seller | Ting | After checking the lock, locks the coins for the buyer under the hash until T2 = now + window, with T2 + 6 h ≤ T1 |
+| Accept | Seller | Ting | After checking the lock, locks the coins for the buyer under the hash until T2 = now + window, with T2 + 6 h ≤ T1. Just before, the seller's page posts the LTC claim it signed ahead |
 | Claim | Buyer's page, or anyone with the secret | Ting | Reveals the secret; the coins go to the buyer |
-| Claim | Seller's page | Litecoin | Spends the lock with the secret |
+| Claim | Anyone with the secret: the buyer's page, a watchtower, the seller's page | Litecoin | Finishes the seller's signed claim with the secret; the lock goes to the seller's payout address |
 | Refund | Anyone | Ting | After T2, the coins go back to the seller |
 | Refund | Buyer | Litecoin | After T1, the lock goes back to the buyer |
 | Release | Seller's page | Ting | Lets a buyer whose take is not accepted have their lock back before T1 |
@@ -259,7 +259,7 @@ in the byte order explorers show, the output's index, and the buyer's key.
 
 | Path | Witness | Transaction |
 |---|---|---|
-| Claim, by the seller | `sig(seller) ‖ secret ‖ 01 ‖ script` | Any; `SIGHASH_ALL` |
+| Claim, signed by the seller | `sig(seller) ‖ secret ‖ 01 ‖ script` | Version 2, the lock its one input with `nSequence = 0xffffffff`, one output, `nLockTime = 0`; `SIGHASH_ALL` |
 | Refund, by the buyer after T1 | `sig(buyer) ‖ 01 ‖ (empty) ‖ script` | `nLockTime = t1`, the input's `nSequence = 0xfffffffe`; `SIGHASH_ALL` |
 | Release, both | `sig(buyer) ‖ sig(seller) ‖ (empty) ‖ (empty) ‖ script` | Version 2, `nLockTime = 0`, `nSequence = 0xffffffff`; the buyer signs `SIGHASH_ALL`, the seller `SIGHASH_NONE | SIGHASH_ANYONECANPAY` |
 
@@ -269,6 +269,29 @@ A release lets a buyer have the lock back before T1. The seller signs only the i
 with `SIGHASH_NONE | SIGHASH_ANYONECANPAY`, so the signature lets the coins go wherever
 the buyer's own signature sends them, and is useless without it. The seller's page posts
 it on Ting, as the release data `01 ‖ txid(32) ‖ u32 vout ‖ Bytes(signature)`.
+
+The claim needs no one but the seller, and the seller can sign it before anyone but the
+buyer knows the secret: BIP 143's digest covers the transaction, not its witness, so the
+secret goes in later. The seller's page signs the claim of a lock to its payout address
+as it accepts that lock, and posts the signature on Ting as release data version 2, the
+**signed claim**:
+
+```text
+02 ‖ txid(32) ‖ u32 vout ‖ u64 value ‖ Bytes(script) ‖ Bytes(signature)
+```
+
+`txid` and `vout` name the lock, `value` and `script` the claim's one output (a standard
+output script: P2PKH, P2SH, P2WPKH, P2WSH or P2TR), and `signature` is the seller's
+`SIGHASH_ALL` signature with its sighash byte, at most 160 bytes in all. With the
+transaction fixed as the table above says, the signature signs that one transaction:
+whoever adds the secret, and whichever branch of the script uses the signature (beside
+the buyer's, the release branch takes it too), the lock can go only to that output, less
+the fee `value` leaves. Once the buyer's claim on Ting makes the secret public, anyone can
+finish the claim and send it, so the seller need not be there. Its fee is fixed when it is
+signed; the seller's page pays twice the rate of the moment, at least 10 litoshi per
+vbyte, for a claim of about 170 vbytes. Anyone can post release data: a signed claim
+counts only when its signature verifies against the listing's key, the script rebuilt
+from the take, and the lock's value as Litecoin has it.
 
 ## The page
 
@@ -367,7 +390,14 @@ computer.
   address at least the wanted amount, has enough confirmations, and is unspent, and if
   `t1` leaves the program's gap and 10 minutes more. It shows the result for each take,
   and offers the accept, a call link, only for a take that passes, checked again at the
-  click.
+  click. It accepts only with a payout address (a trade restored from a backup code asks
+  for it again, or takes it from a signed claim of the lock already on Ting), since it
+  signs the claim to it: at the click, before it shows the accept link, it posts that
+  lock's signed claim on Ting, unless one verifying is there already (and then says,
+  before the link, when that claim pays another address than this browser's), and does
+  not show the link if it cannot. Until the buyer claims, it keeps one on Ting: it adopts one
+  verifying that is there, whichever browser with the backup code posted it, posts its
+  own if there is none, and posts the same data again if the node lost the posting.
 - **Accepts and releases.** A release lets a buyer take the lock back; an accept holds
   the DLR for them. Both for one lock would give the buyer both sides. The seller's page
   refuses to accept a lock it released or sent a release of, and notes which lock each
@@ -388,6 +418,11 @@ computer.
   than 2 hours and 30 minutes away (the program's claims, above); a claim it sent, which
   made the secret public, it sends again until it is buried. Past that point it says why it
   does not claim, and the buyer refunds the LTC after T1.
+- **The buyer's page sends the seller's claim.** Once its claim is on Ting, and never
+  before (that would hand over the LTC before the DLR), the buyer's page finishes the
+  seller's signed claim of its lock with its secret and sends it, and sends it again while
+  the explorer does not know it, until the lock is spent. With an honest buyer the swap
+  completes with the seller away.
 - **Burying, and reorganizations.** Ting has no fixed finality. A seller who sees the
   claim's secret in the pool could out-mine the blocks since the accept and put a
   withdrawal in its place, at the same TCR-1 nonce, so that the accept can never come
@@ -404,11 +439,20 @@ computer.
   address, an underpayment, a second payment, dust, is the buyer's, though the secret
   opens it too once it is public. A dust take or a copy of the take cannot get in the
   way, since nothing else is in the transaction. The listing is done once that output is
-  spent in a block. The page sends a claim again while the explorer does not know it,
-  gives up one Litecoin refuses outright and claims anew, and warns when a claim has
-  waited more than 30 minutes for a block: it cannot be sped up (it does not signal
-  replace-by-fee, and has no output of the seller's to pay more from), and it must be in
-  a block before T1. The claim, and sending it again, need only the claimed event the
+  spent in a block, whoever sent the claim. The page keeps the signed claim of the lock
+  that is on Ting first, verifying against the listing's key, among its claims, by the
+  claim's txid, which the secret does not change, whichever browser with the backup code
+  posted it: a second browser adopts it rather than signing another, which would spend
+  the same lock, and takes its payout address from it. The page finishes and sends that
+  one, the same transaction the buyer's page or a watchtower sends, gives up any other
+  it signed, and builds a claim of its own, at the rate of the moment, only if there is
+  no signed claim or Litecoin refused it. The page sends a claim again while the
+  explorer does not know it, gives up one Litecoin refuses outright and claims anew, and
+  warns when a claim has waited more than 30 minutes for a block. It must be in a block
+  before T1. The page cannot speed it up, since it does not signal replace-by-fee, but
+  the wallet holding the payout address can: spending the claim's output, unconfirmed,
+  with a high fee pays for both (child pays for parent). An exchange's deposit address
+  cannot, and the warning says so. The claim, and sending it again, need only the claimed event the
   page already read and Litecoin: they go out while the page's Ting node cannot be
   reached.
 - **The way back.** After the deadline anyone may send the refund on Ting; the page offers
@@ -470,7 +514,9 @@ What is left before it is published:
   `<seller> OP_CHECKSIG` in the claim branch: once that lock's secret is public, anyone
   can sweep a released lock its buyer has not taken back, to anywhere. Unique secrets
   prevent it (one counter, one trade); a version 2 script could separate the branches.
-- **Fee bumping.** An LTC claim cannot be sped up: it does not signal replace-by-fee, and
-  has no output of the seller's for a child to pay more from. The page warns after 30
-  minutes, but a claim stuck past T1 can be refunded by a buyer who builds the refund
+- **Fee bumping.** An LTC claim does not signal replace-by-fee, and its fee is fixed when
+  the seller's page signs it at the accept, up to 7 days before it goes out. Only the
+  wallet holding the payout address can speed it up, by child pays for parent; the page
+  warns after 30 minutes and says how, but a seller paid to an exchange's deposit address
+  has no way, and a claim stuck past T1 can be refunded by a buyer who builds the refund
   outside the page.

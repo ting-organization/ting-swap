@@ -969,6 +969,21 @@ group('the lock', () => {
   check(back.txid === LOCK_TXID && back.vout === VOUT && hex(back.signature) === hex(signature), 'and read back');
   throws(() => L.decodeRelease(Uint8Array.from([...release, 0])), /trailing/, 'release data a byte long');
   throws(() => L.decodeRelease(Uint8Array.from([0, ...release.subarray(1)])), /version 0/, 'release data of version 0');
+
+  const out = { value: 123_456, script: L.addressToScript('rltc1q3kquwp848h4juq7rl5q3wqsr29pd3d6wprzz8k', 'regtest') };
+  const signedClaim = L.encodeSignedClaim({ txid: LOCK_TXID, vout: VOUT, out, signature });
+  check(hex(signedClaim) === `02${LOCK_TXID}0100000040e201000000000016000000${hex(out.script)}08000000${hex(signature)}`, 'the signed claim: 02 ‖ txid ‖ u32 vout ‖ u64 value ‖ Bytes(script) ‖ Bytes(signature)');
+  const claimBack = L.decodeSignedClaim(signedClaim);
+  check(claimBack.txid === LOCK_TXID && claimBack.vout === VOUT && claimBack.out.value === 123_456 && hex(claimBack.out.script) === hex(out.script) && hex(claimBack.signature) === hex(signature), 'and read back');
+  throws(() => L.decodeRelease(signedClaim), /version 2/, 'a signed claim is no release');
+  throws(() => L.decodeSignedClaim(release), /version 1/, 'a release is no signed claim');
+  throws(() => L.decodeSignedClaim(Uint8Array.from([...signedClaim, 0])), /trailing/, 'a signed claim a byte long');
+  throws(() => L.decodeSignedClaim(signedClaim.subarray(0, -1)), /truncated/, 'a signed claim a byte short');
+  throws(() => L.decodeSignedClaim(unhex(`02${LOCK_TXID}010000000100000000000000020000006a0008000000${hex(signature)}`)), /standard output/, 'a signed claim to a script with no address');
+  throws(() => L.decodeSignedClaim(unhex(`02${LOCK_TXID}01000000000000000000000016000000${hex(out.script)}08000000${hex(signature)}`)), /not an amount/, 'a signed claim of nothing');
+  throws(() => L.decodeSignedClaim(unhex(`02${LOCK_TXID}01000000ffffffffffffffff16000000${hex(out.script)}08000000${hex(signature)}`)), /not an amount/, 'a signed claim of more than there is');
+  throws(() => L.encodeSignedClaim({ txid: LOCK_TXID, vout: VOUT, out: { value: 1, script: unhex('6a00') }, signature }), /standard output/, 'no signed claim to a script with no address');
+  throws(() => L.encodeSignedClaim({ txid: LOCK_TXID, vout: VOUT, out, signature: new Uint8Array(0) }), /no signature/, 'no signed claim without a signature');
 });
 
 group('spending the lock', () => {
@@ -1089,6 +1104,49 @@ group('spending the lock', () => {
   throws(() => L.claimTx({ ...lock, htlc: { ...HTLC, t1: 5 }, secret: SECRET, key: SELLER }), /T1/, 'a lock that is not one');
   const low = L.claimTx({ ...lock, value: 3000 + 2000, secret: SECRET, key: SELLER });
   check(L.parseTx(low.hex).outputs[0].value >= 2940, 'just above dust is fine');
+
+  // The seller's claim signed ahead, before anyone but the buyer knows the secret, and finished by whoever does.
+  const OTHER_SCRIPT = L.witnessOutput(0, sha('another payout').subarray(0, 20));
+  const ahead = L.signClaim({ ...lock, key: SELLER });
+  check(ahead.txid === LOCK_TXID && ahead.vout === VOUT && hex(ahead.out.script) === hex(L.addressToScript(to, 'regtest')) && ahead.out.value + ahead.fee === VALUE, 'signed claim: the lock, one output to the address, and the fee');
+  check(ahead.claim === claim.txid, 'signed claim: the claim\'s txid, known before the secret is in');
+  check(L.signedClaimTxid(L.decodeSignedClaim(L.encodeSignedClaim(ahead))) === claim.txid, 'signed claim: its txid from its release data alone');
+  check(L.encodeSignedClaim(ahead).length <= 256, 'signed claim: its release data fits the program\'s 256 bytes');
+  const claimOk = (changes = {}) => L.verifyClaimSignature({ txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC, out: ahead.out, signature: ahead.signature, ...changes });
+  check(claimOk(), 'signed claim: the signature checks');
+  check(!claimOk({ vout: 0 }), 'signed claim: not for another output');
+  check(!claimOk({ value: VALUE - 1 }), 'signed claim: not for another value');
+  check(!claimOk({ txid: hex(sha('another')) }), 'signed claim: not for another transaction');
+  check(!claimOk({ htlc: { ...HTLC, t1: T1 + 1 } }), 'signed claim: not for another lock');
+  check(!claimOk({ htlc: { ...HTLC, seller: HTLC.buyer } }), 'signed claim: not as another seller');
+  check(!claimOk({ out: { ...ahead.out, value: ahead.out.value + 1 } }), 'signed claim: not for more out');
+  check(!claimOk({ out: { ...ahead.out, script: OTHER_SCRIPT } }), 'signed claim: not to another address');
+  check(!claimOk({ out: { ...ahead.out, value: VALUE } }), 'signed claim: not with no fee');
+  check(!claimOk({ out: { ...ahead.out, script: unhex('6a00') } }), 'signed claim: not to a script with no address');
+  check(!claimOk({ signature: Uint8Array.from([...ahead.signature.subarray(0, -1), 0x82]) }), 'signed claim: not with another sighash byte');
+  const parts = S.parseDer(ahead.signature.subarray(0, -1));
+  check(!claimOk({ signature: Uint8Array.from([...S.encodeDer(parts.r, S.N - parts.s), 1]) }), 'signed claim: not with a high S');
+  check(!claimOk({ signature: L.releaseSignature({ ...lock, key: SELLER }) }), 'signed claim: a release signature is none');
+  check(!claimOk({ signature: new Uint8Array(0) }) && !claimOk({ signature: Uint8Array.of(1) }), 'signed claim: not an empty signature');
+
+  const finished = L.finishClaim({ txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC, out: ahead.out, signature: ahead.signature, secret: SECRET });
+  check(finished.hex === claim.hex && finished.txid === claim.txid && finished.fee === claim.fee, 'signed claim, finished with the secret: byte for byte claimTx\'s claim');
+  common(finished, 'finished claim', { locktime: 0, sequence: 0xffffffff, items: 4 });
+  const posted = L.decodeSignedClaim(L.encodeSignedClaim(ahead));
+  const fromTing = L.finishClaim({ txid: posted.txid, vout: posted.vout, value: VALUE, htlc: HTLC, out: posted.out, signature: posted.signature, secret: SECRET });
+  check(fromTing.hex === claim.hex, 'signed claim: read back from its release data, the same claim');
+  throws(() => L.finishClaim({ txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC, out: ahead.out, signature: ahead.signature, secret: sha('a guess') }), /does not hash/, 'finishing with another secret');
+  throws(() => L.finishClaim({ txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC, out: { ...ahead.out, value: ahead.out.value + 1 }, signature: ahead.signature, secret: SECRET }), /does not sign/, 'finishing with another output');
+  throws(() => L.signClaim({ ...lock, key: BUYER }), /seller key/, 'a signed claim with the buyer\'s key');
+
+  // The same signature in the release branch, beside the buyer's: it signs only this transaction, so it still pays only the seller.
+  const branch = structuredClone(finished.tx);
+  branch.inputs[0].witness = [Uint8Array.from([...S.sign(BUYER, L.sighash(branch, 0, script, VALUE, 1)), 1]), ahead.signature, new Uint8Array(0), new Uint8Array(0), script];
+  check(run(branch, 0, VALUE, program) === null, 'signed claim: in the release branch beside the buyer\'s signature, it spends the lock to the seller\'s output');
+  const redirected = structuredClone(branch);
+  redirected.outputs[0].script = OTHER_SCRIPT;
+  redirected.inputs[0].witness[0] = Uint8Array.from([...S.sign(BUYER, L.sighash(redirected, 0, script, VALUE, 1)), 1]);
+  check(run(redirected, 0, VALUE, program) !== null, 'signed claim: but to any other output it fails');
 });
 
 group('refunding several locks at once', () => {
