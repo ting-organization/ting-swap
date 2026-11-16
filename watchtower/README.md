@@ -4,8 +4,9 @@ A small Node.js service beside Ting Swap's Litecoin page. It reads the HTLC prog
 Ting and the locks on Litecoin, and:
 
 - **keeps a Discord feed** of the listings: one message per listing, edited as it moves
-  from open to locked, accepted, and swapped, withdrawn or refunded, with its rate,
-  window and a link to the page;
+  from open to locked, accepted, and swapped, withdrawn or refunded, on one line: its
+  rate, an estimate in dollars per DLR and in all (from LTC's price when it was posted),
+  the time to claim and its status, colored by status, with a link to the page;
 - **reminds those who watch a listing**, by direct message, at the steps that need them:
   a seller when a buyer locked LTC and before the time to accept ends, a buyer when
   their lock is accepted and before the claim cut-off, a seller after the buyer's claim

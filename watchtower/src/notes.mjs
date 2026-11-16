@@ -19,42 +19,52 @@ export function amounts(trade, coin) {
   return { dlr, ltc };
 }
 
+/** Each status as the feed shows it, and the color of its embed's bar. */
 const STATUS = {
-  open: 'Open',
-  locked: 'A buyer locked LTC: waiting for the seller to accept',
-  accepted: 'Accepted: waiting for the buyer to claim',
-  swapped: 'Swapped',
-  withdrawn: 'Withdrawn',
-  refunded: 'Not claimed in time: the DLR went back to the seller',
+  open: { text: '🟢 Open', color: 0x639922 },
+  locked: { text: '🟠 Buyer locked LTC', color: 0xba7517 },
+  accepted: { text: '🔵 Accepted', color: 0x378add },
+  swapped: { text: '⚪ Swapped', color: 0x888780 },
+  withdrawn: { text: '⚪ Withdrawn', color: 0x888780 },
+  refunded: { text: '⚪ Refunded', color: 0x888780 },
 };
 
+/** Dollars: a total to the cent, and a price per coin to three significant digits, however small. */
+const CENTS = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const UNIT = new Intl.NumberFormat('en-US', { minimumSignificantDigits: 3, maximumSignificantDigits: 3 });
+
 /**
- * The feed message of a listing: an embed with what it offers, its rate,
- * window and status, and buttons to watch it while it is not over. `locked`
- * says whether Litecoin showed a lock paying it.
+ * The feed message of a listing: an embed whose title says what a buyer gets
+ * for what, one line with the rate, the estimate in dollars (from LTC's price
+ * `usd`, per DLR and in all), the time to claim and the status, and buttons to
+ * watch it while it is not over. `locked` says whether Litecoin showed a lock
+ * paying it.
  */
 export function feedMessage(trade, { coin, usd, pageUrl, locked }) {
   const { dlr, ltc } = amounts(trade, coin);
   const l = trade.listed;
-  const perLtc = rate(BigInt(l.want), 8, l.amount, coin.decimals, 6);
-  const lines = [
-    `**Rate:** ${perLtc} ${coin.symbol} per LTC${usd ? ` · about $${(usd * Number(l.want) / 1e8).toFixed(2)} for the lot` : ''}`,
-    `**Lock window:** ${l.window / HOUR} h once accepted`,
-  ];
+  const st = STATUS[status(trade, { locked })];
+  const parts = [`${rate(BigInt(l.want), 8, l.amount, coin.decimals, 4)} ${coin.symbol}/LTC`];
+  if (usd) {
+    const total = usd * Number(l.want) / 1e8;
+    const units = Number(l.amount) / 10 ** coin.decimals;
+    if (units > 0) parts.push(`≈ $${UNIT.format(total / units)}/${coin.symbol}`);
+    parts.push(`$${CENTS.format(total)} total`);
+  }
+  parts.push(`${l.window / HOUR} h to claim`, st.text);
+  const lines = [parts.join(' · ')];
   if (l.taker && !l.taker.every((b) => b === 0)) lines.push(`**Only for:** \`${short(l.taker)}\``);
   if (trade.copyOf != null) lines.push(`**Careful:** this listing names the Litecoin key of #${trade.copyOf}. Anyone can list with a key: the page shows whose it is.`);
-  const st = status(trade, { locked });
-  lines.push(`**Status:** ${STATUS[st]}`);
   const url = `${pageUrl}#/l/${trade.id}`;
-  const buttons = [{ type: 2, style: 5, label: 'Open', url }];
+  const buttons = [{ type: 2, style: 5, label: 'Trade on Ting Swap', url }];
   if (!closed(trade)) {
     buttons.unshift(
-      { type: 2, style: 1, label: 'Remind me: seller', custom_id: `watch:${trade.id}:seller` },
-      { type: 2, style: 2, label: 'Remind me: buyer', custom_id: `watch:${trade.id}:buyer` },
+      { type: 2, style: 1, label: 'Remind me as buyer', custom_id: `watch:${trade.id}:buyer` },
+      { type: 2, style: 2, label: 'Remind me as seller', custom_id: `watch:${trade.id}:seller` },
     );
   }
   return {
-    embeds: [{ title: `#${trade.id} · ${dlr} for ${ltc}`, url, description: lines.join('\n'), color: closed(trade) ? 0x8a8f98 : 0x2f7d6b }],
+    embeds: [{ title: `#${trade.id} · Buy ${dlr} for ${ltc}`, url, description: lines.join('\n'), color: st.color }],
     components: [{ type: 1, components: buttons }],
   };
 }

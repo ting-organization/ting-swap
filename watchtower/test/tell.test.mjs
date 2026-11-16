@@ -43,7 +43,7 @@ test('the feed: posted, edited, posted anew when deleted, small listings left ou
   await feed(tradesOf([F.listed(1)], F.coin), state, discord);
   assert.equal(discord.calls.length, 1, 'nothing changed: nothing sent');
   await feed(tradesOf([F.listed(1), F.withdrawn(1)], F.coin), state, discord);
-  assert.deepEqual(discord.calls.at(-1), ['edit', 'm1', '#1 · 10 DLR for 0.5 LTC']);
+  assert.deepEqual(discord.calls.at(-1), ['edit', 'm1', '#1 · Buy 10 DLR for 0.5 LTC']);
   discord.failEdit = Object.assign(new Error('Unknown Message'), { status: 404, code: 10008 });
   await feed(tradesOf([F.listed(1), F.taken(1), F.accepted(1)], F.coin), state, discord);
   assert.deepEqual(discord.calls.slice(-2).map((c) => c[0]), ['edit', 'post'], 'deleted: posted anew');

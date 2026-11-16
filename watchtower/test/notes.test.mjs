@@ -74,19 +74,29 @@ test('the buyer of a lock not accepted: withdrawn, and refundable after T1', () 
   assert.deepEqual(keys(notesFor(trade(F.taken(1), F.withdrawn(1)), 'buyer', view())), ['withdrawn']);
 });
 
-test('the feed message: what it offers, a copy warned of, no buttons once over', () => {
+test('the feed message: one line of what it offers, a copy warned of, no buttons once over', () => {
   const open = feedMessage(trade(), { coin: F.COIN, usd: 44, pageUrl: 'https://example.test/swap/', locked: false });
-  assert.equal(open.embeds[0].title, '#1 · 10 DLR for 0.5 LTC');
+  assert.equal(open.embeds[0].title, '#1 · Buy 10 DLR for 0.5 LTC');
   assert.equal(open.embeds[0].url, 'https://example.test/swap/#/l/1');
-  assert.match(open.embeds[0].description, /\*\*Rate:\*\* 20 DLR per LTC · about \$22\.00 for the lot/);
-  assert.match(open.embeds[0].description, /\*\*Status:\*\* Open$/);
-  assert.deepEqual(open.components[0].components.map((b) => b.custom_id ?? b.url), ['watch:1:seller', 'watch:1:buyer', 'https://example.test/swap/#/l/1']);
+  assert.equal(open.embeds[0].description, '20 DLR/LTC · ≈ $2.20/DLR · $22.00 total · 12 h to claim · 🟢 Open');
+  assert.equal(open.embeds[0].color, 0x639922);
+  assert.deepEqual(open.components[0].components.map((b) => b.custom_id ?? b.url), ['watch:1:buyer', 'watch:1:seller', 'https://example.test/swap/#/l/1']);
+  assert.deepEqual(open.components[0].components.map((b) => b.style), [1, 2, 5], 'the buyer\'s button stands out');
   const locked = feedMessage(trade(F.taken(1)), { coin: F.COIN, usd: null, pageUrl: 'x/', locked: true });
-  assert.match(locked.embeds[0].description, /A buyer locked LTC/);
-  assert.doesNotMatch(locked.embeds[0].description, /\$/);
+  assert.equal(locked.embeds[0].description, '20 DLR/LTC · 12 h to claim · 🟠 Buyer locked LTC', 'no price: no dollars');
+  assert.equal(locked.embeds[0].color, 0xba7517);
+  assert.match(feedMessage(trade(F.taken(1), F.accepted(1)), { coin: F.COIN, usd: null, pageUrl: 'x/', locked: true }).embeds[0].description, /🔵 Accepted$/);
   const swapped = feedMessage(trade(F.taken(1), F.accepted(1), F.claimed(1)), { coin: F.COIN, usd: null, pageUrl: 'x/', locked: true });
-  assert.deepEqual(swapped.components[0].components.map((b) => b.label), ['Open']);
-  assert.match(swapped.embeds[0].description, /Swapped$/);
+  assert.deepEqual(swapped.components[0].components.map((b) => b.label), ['Trade on Ting Swap']);
+  assert.match(swapped.embeds[0].description, /⚪ Swapped$/);
+  assert.equal(swapped.embeds[0].color, 0x888780);
   const copy = tradesOf([F.listed(1), F.listed(2)], F.coin).get(2);
-  assert.match(feedMessage(copy, { coin: F.COIN, usd: null, pageUrl: 'x/', locked: false }).embeds[0].description, /names the Litecoin key of #1/);
+  assert.match(feedMessage(copy, { coin: F.COIN, usd: null, pageUrl: 'x/', locked: false }).embeds[0].description, /\n\*\*Careful:\*\* this listing names the Litecoin key of #1/);
+});
+
+test('the feed message\'s numbers: the rate to four digits, dollars per DLR to three however small', () => {
+  const big = tradesOf([F.listed(1, { amount: 209_000n * 100_000_000n, want: 600_000_000n })], F.coin).get(1);
+  assert.equal(feedMessage(big, { coin: F.COIN, usd: 44, pageUrl: 'x/', locked: false }).embeds[0].description, '34,833 DLR/LTC · ≈ $0.00126/DLR · $264.00 total · 12 h to claim · 🟢 Open');
+  const even = tradesOf([F.listed(1, { amount: 10_000n * 100_000_000n, want: 200_000_000n })], F.coin).get(1);
+  assert.match(feedMessage(even, { coin: F.COIN, usd: 44, pageUrl: 'x/', locked: false }).embeds[0].description, /^5,000 DLR\/LTC · ≈ \$0\.00880\/DLR · \$88\.00 total/);
 });
