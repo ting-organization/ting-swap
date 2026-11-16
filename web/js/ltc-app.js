@@ -1682,17 +1682,19 @@ function stepOf(t) {
 function marketRow(l) {
   const yours = Boolean(mine(l.id, 'seller'));
   const d = tradeOf(l.id);
-  const locks = d.takes.filter((x) => !releaseOf(d, x)).length;
+  // A buyer's lock not released, unless what the page already read shows it can never be accepted. The market reads no
+  // Litecoin of its own for this: a take posted for nothing still counts until a view of the listing has read it.
+  const locks = d.takes.filter((x) => !releaseOf(d, x) && checkTake(d.terms, x).state !== 'bad').length;
   const forOne = !H.isZero(l.taker);
   // What the buyer's page refuses to lock for: offered as a view, not as a buy.
   const refused = l.window < H.MIN_WINDOW ? `held only ${span(l.window)} once accepted: too short to claim safely`
     : BigInt(l.fee) * 1000n > BigInt(l.amount) ? 'its claim pays more than a thousandth in fees' : '';
-  return `<article class="listing ltc-row${yours ? ' own' : ''}" data-id="${l.id}">
+  return `<article class="listing ltc-row${yours ? ' own' : ''}${locks ? ' locked' : ''}" data-id="${l.id}">
     <a class="listing-link" href="#/l/${l.id}" aria-label="Listing ${l.id}"></a>
     <div class="leg get"><span class="label">You get</span>${dlr(l.amount)}</div>
     <div class="leg pay"><span class="label">You pay</span>${ltc(l.want)}${usd(l.want)}</div>
     <div class="leg rate"><span class="label">Rate</span><span class="rate-text">${rateText(l.amount, l.want)}</span>${rateUsd(l.amount, l.want)}</div>
-    <div class="leg meta"><span class="label">#${l.id} · held ${span(l.window)} once accepted</span><span class="meta-line">${yours ? '<span class="badge mine">Your listing</span>' : who(l.maker)}${forOne ? `<span class="badge for-one" title="Only ${hex(l.taker)} can take it">For one buyer</span>` : ''}${locks ? `<span class="badge taken">${plural(locks, 'lock')}</span>` : ''}${refused ? `<span class="badge refused" title="${esc(refused)}">Not buyable here</span>` : ''}</span></div>
+    <div class="leg meta"><span class="label">#${l.id} · held ${span(l.window)} once accepted</span><span class="meta-line">${yours ? '<span class="badge mine">Your listing</span>' : who(l.maker)}${forOne ? `<span class="badge for-one" title="Only ${hex(l.taker)} can take it">For one buyer</span>` : ''}${locks ? `<span class="badge locked" title="The seller accepts one lock; any other buyer gets their LTC back">${locks === 1 ? 'Buyer locked LTC' : `${locks} buyers locked LTC`}</span>` : ''}${refused ? `<span class="badge refused" title="${esc(refused)}">Not buyable here</span>` : ''}</span></div>
     <div class="leg act">${yours ? `<a class="button" href="#/l/${l.id}">Open</a>` : refused ? `<a class="button" href="#/l/${l.id}">View</a>` : `<a class="button primary" href="#/l/${l.id}">Buy with LTC</a>`}</div>
   </article>`;
 }
@@ -2127,19 +2129,19 @@ function sellerPanel(d, t, form) {
       ${rows ? `<p>${toRelease ? 'Your page releases the buyers’ locks by itself, so they get their LTC back at once:' : 'The locks buyers posted for it:'}</p>${rows}` : ''}`, 'done');
   }
   const rows = takeRows(d, { seller: true });
-  const share = `<div class="row">${shareButton(d)}</div>`;
-  const withdraw = `<details class="owner" data-keep="withdraw"><summary>Withdraw the listing</summary><p class="hint">Your ${esc(app.dlr.symbol)} come back to the account that listed them. Ting ID signs it; anyone who locked LTC can still be released.</p><button data-withdraw>${icon('undo')} Withdraw with Ting ID</button></details>`;
+  // Withdrawing sits beside sharing, in plain view: Ting ID still asks before anything happens.
+  const actions = `<div class="row">${shareButton(d)}<button data-withdraw>${icon('undo')} Withdraw listing</button></div>
+    <p class="hint">Withdrawing brings your ${esc(app.dlr.symbol)} back to the account that listed them; Ting ID asks you to sign it.${rows ? ' Your page then releases every buyer’s lock, so they get their LTC back at once.' : ''}</p>`;
   if (!rows) {
     return panel('Waiting for a buyer', `<p>Your listing is open. Share the link with a buyer.</p>
-      ${share}
-      ${waiting('Watching for a buyer’s LTC lock. The buyer always pays first.')}
-      ${withdraw}`, 'wait');
+      ${actions}
+      ${waiting('Watching for a buyer’s LTC lock. The buyer always pays first.')}`, 'wait');
   }
   return panel('A buyer locked LTC: check and accept', `<p>Your page checked each lock on Litecoin.</p>
     ${payoutField(t, form)}
     ${rows}
     ${nextLine(`Accepting holds your ${dlr(l.amount)} for that buyer for ${span(l.window)}. As you accept, your page signs the claim of the LTC to your address and posts it on Ting, so that it can be sent for you once the buyer claims.`)}
-    ${share}${withdraw}`, 'act');
+    ${actions}`, 'act');
 }
 
 /** The takes of a listing, each with its check; for the seller with Accept and Decline. */

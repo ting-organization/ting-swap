@@ -186,6 +186,8 @@ input[type=checkbox] { width: 15px; height: 15px; margin: 0; accent-color: var(-
 .badge.taken::before, .badge.mine::before { background: var(--accent); }
 .badge.for-one::before { background: var(--attn); }
 .badge.refused::before { background: var(--bad); }
+.badge.locked { border-color: var(--attn); color: var(--attn); }
+.badge.locked::before { background: var(--attn); }
 
 /* ---- Layout */
 main { flex: 1; width: 100%; max-width: var(--page); margin: 0 auto; padding: 28px var(--gutter) 64px; }
@@ -258,6 +260,9 @@ button.pill { min-height: 30px; padding: 4px 10px; }
   transition: background-color .12s;
 }
 .listing:hover { background: var(--hover); }
+/* A buyer locked LTC for it: tinted like the feed's amber, so it stands out in the list. */
+.listing.locked { background: var(--attn-soft); box-shadow: inset 3px 0 0 var(--attn); }
+.listing.locked:hover { background: color-mix(in srgb, var(--attn-soft) 92%, var(--attn)); }
 .listing-link { position: absolute; inset: 0; }
 .listing-link:focus-visible { outline-offset: -2px; }
 .listing .leg { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
