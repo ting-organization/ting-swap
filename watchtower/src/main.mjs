@@ -16,7 +16,7 @@ import { decodeCoin } from '../../web/js/swap.js';
 import { sendClaims, sendRefunds } from './act.mjs';
 import { Litecoin, Ting } from './chains.mjs';
 import { answer, Discord, signedByDiscord } from './discord.mjs';
-import { readsDue } from './reads.mjs';
+import { outsInUse, readsDue } from './reads.mjs';
 import * as S from './state.mjs';
 import { sendNotes, updateFeed, welcome } from './tell.mjs';
 import { claimOf, lockOf, pays, tradesOf } from './trades.mjs';
@@ -64,16 +64,30 @@ const state = S.load(config.statePath);
 const outs = new Map(Object.entries(state.outs ?? {}));
 const failed = new Map();
 let trades = new Map();
+/** Whether the listings were read once: before that, no read can be told useless. */
+let read = false;
 let coin = null;
 let usd = null;
 let usdAt = 0;
 let ltcTip = null;
+let saved = null;
 
-/** A dry run keeps nothing: what it only printed must not count as done for the run after it. */
+/**
+ * Writes the state, keeping only the outputs still of use (outsInUse), and
+ * only when it changed. A dry run keeps nothing: what it only printed must not
+ * count as done for the run after it.
+ */
 function saveState() {
   if (config.dryRun) return;
+  if (read) {
+    const keep = outsInUse({ trades, program, net: setup.ltcnet, now: now() });
+    for (const key of outs.keys()) if (!keep.has(key)) outs.delete(key);
+  }
   state.outs = Object.fromEntries(outs);
+  const text = JSON.stringify(state);
+  if (text === saved) return;
   S.save(config.statePath, state);
+  saved = text;
 }
 
 if (args[0] === 'register') {
@@ -141,6 +155,7 @@ async function round() {
   await ting.readTip();
   if (production && ting.tip.chainId !== setup.chainId) throw new Error(`the node moved to chain ${ting.tip.chainId}`);
   trades = tradesOf(await ting.readEvents(), coinId);
+  read = true;
   await readLitecoin();
   const t = now();
   await sendClaims({ trades, program, net: setup.ltcnet, outOf, litecoin, state, now: t, dryRun: config.dryRun, log });

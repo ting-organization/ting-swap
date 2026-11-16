@@ -62,3 +62,12 @@ test('the accepted lock: only when exactly one matching take\'s output pays', ()
   assert.equal(acceptedLockOf(t, F.program, F.NET, (lock) => (lock.txid === F.LOCK_TXID ? F.lockOut(1) : undefined)).state, 'unread', 'one candidate not read yet');
   assert.equal(acceptedLockOf(t, F.program, F.NET, () => ({ missing: true })).state, 'none');
 });
+
+test('a copy of the buyer\'s take, byte for byte, changes nothing', () => {
+  const evs = (copies) => [F.listed(1), ...Array.from({ length: copies }, () => F.taken(1)), F.released(1, F.signedClaimData(1)), F.accepted(1), F.claimed(1)];
+  for (const copies of [1, 2, 5]) {
+    const r = claimOf(tradesOf(evs(copies), F.coin).get(1), F.program, F.NET, () => F.lockOut(1));
+    assert.equal(r.state, 'one', `${copies} take(s) naming the one output: one lock`);
+    assert.ok(r.claim, 'and its signed claim is found');
+  }
+});

@@ -501,10 +501,12 @@ accepted listing whose deadline has passed by the clock and by Ting's tip, with 
 record still there. Going by the clock as well as the tip, it never helps a block stamped
 ahead of time. The accept names no outpoint, and only the seller's page knows which accept
 link was approved, so it sends a claim only when every take matching the accept has been
-read and exactly one pays its script at least the wanted amount, and only that lock's
-signed claim; with two, it leaves the claim to the pages. Its Litecoin reads follow the
-page's rules, at most 12 outputs a round, so nothing posted for free on Ting can make it
-read more, nor push the lock a claim needs out of its turn. It also keeps a Discord feed of the listings and reminds, by direct
+read and exactly one output pays its script at least the wanted amount, and only that
+lock's signed claim; with two outputs, it leaves the claim to the pages. It counts
+outputs, not takes: a copy of the buyer's take naming the same output adds nothing. Its
+Litecoin reads follow the page's rules, at most 12 outputs a round, a claimed listing's
+first and open listings' takes last, so nothing posted for free on Ting can make it read
+more, nor push the lock a claim needs out of its turn. It also keeps a Discord feed of the listings and reminds, by direct
 message, those who watch a listing at the steps that need them. Nothing depends on it:
 the pages do every step themselves, and its reminders say so.
 

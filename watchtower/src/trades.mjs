@@ -102,26 +102,27 @@ export function acceptedLocks(trade, program, net) {
  * each) both do; the seller's page signs a claim at each Accept click. Only
  * the seller's page knows which link was approved, so the watchtower goes by
  * Litecoin alone (`outOf(lock)`, the output as read, undefined if not):
- * - `one`: every matching take's output was read, and exactly one pays its
- *   script at least the wanted amount. That is the accepted lock: the seller's
- *   page accepts only a lock that does, and only a claim, or its buyer after
- *   T1, can spend it. `{ state, take, lock, out }`.
- * - `many`: more than one pays. The watchtower leaves the claim to the pages.
+ * - `one`: every matching take's output was read, and exactly one output pays
+ *   its script at least the wanted amount. That is the accepted lock: the
+ *   seller's page accepts only a lock that does, and only a claim, or its
+ *   buyer after T1, can spend it. `{ state, take, lock, out }`.
+ * - `many`: more than one output pays. The watchtower leaves the claim to the
+ *   pages.
  * - `unread`: a matching take's output is not read yet, or its read failed.
  * - `none`: all are read, and none pays.
+ * Outputs are counted, not takes: anyone can post the buyer's take again,
+ * byte for byte, and a copy naming the same output (which pays one script, so
+ * the same lock) adds nothing.
  */
 export function acceptedLockOf(trade, program, net, outOf) {
-  let found = null;
-  let paying = 0;
+  const paying = new Map();
   for (const c of acceptedLocks(trade, program, net)) {
     const out = outOf(c.lock);
     if (!out) return { state: 'unread' };
-    if (pays(c.lock, out, trade.listed.want)) {
-      paying++;
-      found = { ...c, out };
-    }
+    if (pays(c.lock, out, trade.listed.want) && !paying.has(c.lock.key)) paying.set(c.lock.key, { ...c, out });
   }
-  if (paying > 1) return { state: 'many' };
+  if (paying.size > 1) return { state: 'many' };
+  const [found] = paying.values();
   return found ? { state: 'one', ...found } : { state: 'none' };
 }
 
