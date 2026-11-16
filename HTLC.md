@@ -415,12 +415,14 @@ computer.
   it. A buyer whose lock the seller released takes it back at once. After T1, by
   Litecoin's median time past, the buyer's page refunds every output in a block at the lock
   address in one transaction: offered whenever LTC sits there, including an underpaid
-  lock and a payment whose take was refused or came too late. The buyer's page says
-  plainly, before paying, on an underpayment, and before claiming, that once the claim
-  makes the secret public the seller can take anything else at the lock address too; it
-  promises such outputs back only if the trade does not go ahead, and after the swap only
-  if they are still there after T1. A release or refund is kept only once Litecoin took
-  it, and sent again while the explorer does not know it.
+  lock and a payment whose take was refused or came too late. Once the buyer's claim is on
+  Ting, the refund leaves out the lock that claim was for, and the page never sends again a
+  refund that spends it: that lock is the seller's, however late they claim. The buyer's
+  page says plainly, before paying, on an underpayment, and before claiming, that once
+  the claim makes the secret public the seller can take anything else at the lock address
+  too; it promises such outputs back only if the trade does not go ahead, and after the
+  swap only if they are still there after T1. A release or refund is kept only once
+  Litecoin took it, and sent again while the explorer does not know it.
 - **Reading.** Every 4 seconds while a trade of this browser is open, or a trade is on
   screen, whatever the view, the page reads Ting, then Litecoin, then runs each open
   listing's automatic steps; one listing's failure is that listing's alone. Each Litecoin
@@ -470,4 +472,5 @@ What is left before it is published:
   prevent it (one counter, one trade); a version 2 script could separate the branches.
 - **Fee bumping.** An LTC claim cannot be sped up: it does not signal replace-by-fee, and
   has no output of the seller's for a child to pay more from. The page warns after 30
-  minutes, but a claim stuck past T1 can be refunded by the buyer.
+  minutes, but a claim stuck past T1 can be refunded by a buyer who builds the refund
+  outside the page.
