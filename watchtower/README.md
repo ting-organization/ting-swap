@@ -45,9 +45,12 @@ Each round reads Ting, then at most 12 Litecoin outputs (two requests each), by 
 page's rules: one Litecoin did not have again after 5 minutes, one that pays another
 script or is spent in a block never again, the lock a claimed listing's signed claim
 spends every round until a spend of it is in a block, and the rest every 10 minutes, the
-least recently read first. A claimed listing's locks come first (those never read too,
-since its claim waits for all of them), then accepted listings', and open listings'
-takes, which anyone can post for free, last. Then it sends claims and refunds. The feed and the reminders
+least recently read first. The lock a claimed listing's signed claim spends comes
+first. Then a claimed listing's locks never read, since its claim waits for all of them:
+shared out among the claimed listings, those with the fewest first (a real trade's one
+ahead of a listing with copies of its take posted for nothing), in turns, two a round
+each at most. Then accepted listings' locks, and open listings' takes, which anyone can
+post for free, last. Then it sends claims and refunds. The feed and the reminders
 run apart from that, so that a slow Discord never holds them up, and no request waits
 longer than 20 seconds.
 
@@ -76,7 +79,10 @@ Settings, as environment variables:
 The state file holds nothing secret; losing it loses only that bookkeeping (watchers,
 the feed's message ids, the reminders sent, the outputs read). It keeps only the
 outputs still of use (open listings', and accepted or withdrawn ones' until a day past
-T1), and is written only when it changed. A feed message a moderator deletes is posted
+T1), and is written only when it changed. Of open and withdrawn listings it writes only
+outputs that pay their lock's script: one missing or paying another script, most often
+from a take posted for nothing, stays in memory and is read once more after a restart,
+so that such takes do not grow the file. A feed message a moderator deletes is posted
 anew.
 
 ## Discord

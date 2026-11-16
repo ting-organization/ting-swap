@@ -71,19 +71,24 @@ let usd = null;
 let usdAt = 0;
 let ltcTip = null;
 let saved = null;
+/** Rounds run, for the turns readsDue gives listings. */
+let rounds = 0;
 
 /**
- * Writes the state, keeping only the outputs still of use (outsInUse), and
- * only when it changed. A dry run keeps nothing: what it only printed must not
- * count as done for the run after it.
+ * Writes the state, keeping only the outputs still of use, and in the file
+ * only those worth keeping across a restart (outsInUse), and only when it
+ * changed. A dry run keeps nothing: what it only printed must not count as
+ * done for the run after it.
  */
 function saveState() {
   if (config.dryRun) return;
   if (read) {
-    const keep = outsInUse({ trades, program, net: setup.ltcnet, now: now() });
-    for (const key of outs.keys()) if (!keep.has(key)) outs.delete(key);
+    const { memory, file } = outsInUse({ trades, program, net: setup.ltcnet, now: now(), outs });
+    for (const key of outs.keys()) if (!memory.has(key)) outs.delete(key);
+    state.outs = Object.fromEntries([...outs].filter(([key]) => file.has(key)));
+  } else {
+    state.outs = Object.fromEntries(outs);
   }
-  state.outs = Object.fromEntries(outs);
   const text = JSON.stringify(state);
   if (text === saved) return;
   S.save(config.statePath, state);
@@ -129,7 +134,8 @@ async function readLitecoin() {
     usd = (await litecoin.usd()) ?? usd;
     usdAt = now();
   }
-  for (const lock of readsDue({ trades, program, net: setup.ltcnet, outs, failed, now: now(), claimOf: claimOfTrade })) await readOut(lock);
+  rounds++;
+  for (const lock of readsDue({ trades, program, net: setup.ltcnet, outs, failed, now: now(), claimOf: claimOfTrade, round: rounds })) await readOut(lock);
 }
 
 /** Whether a buyer's lock pays an open listing and is not spent: released and taken back, it is no lock any more. */

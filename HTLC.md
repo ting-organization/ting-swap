@@ -504,9 +504,11 @@ link was approved, so it sends a claim only when every take matching the accept 
 read and exactly one output pays its script at least the wanted amount, and only that
 lock's signed claim; with two outputs, it leaves the claim to the pages. It counts
 outputs, not takes: a copy of the buyer's take naming the same output adds nothing. Its
-Litecoin reads follow the page's rules, at most 12 outputs a round, a claimed listing's
-first and open listings' takes last, so nothing posted for free on Ting can make it read
-more, nor push the lock a claim needs out of its turn. It also keeps a Discord feed of the listings and reminds, by direct
+Litecoin reads follow the page's rules, at most 12 outputs a round, so nothing posted for
+free on Ting can make it read more. The lock a sent claim spends comes first; then a
+claimed listing's locks not read yet, shared out among the claimed listings, those with
+the fewest first and two a round each at most, so that copies of a take posted for
+nothing hold up mostly their own listing; open listings' takes come last. It also keeps a Discord feed of the listings and reminds, by direct
 message, those who watch a listing at the steps that need them. Nothing depends on it:
 the pages do every step themselves, and its reminders say so.
 
