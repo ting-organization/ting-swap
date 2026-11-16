@@ -1316,7 +1316,7 @@ async function autoSeller(d, t, { ting = true } = {}) {
   if (ting && (d.accepted || d.withdrawn)) await releaseOthers(d, t);
   if (!d.claimed) {
     // Until the buyer claims, the accepted lock's signed claim stays on Ting, for whoever sends it then.
-    if (ting && d.accepted && t.payout && now() <= d.accepted.deadline) {
+    if (ting && d.accepted && now() <= d.accepted.deadline) {
       const c = acceptedLock(d, t);
       if (c && !c.out.spent) await keepSignedClaim(d, t, c);
     }
@@ -1324,13 +1324,24 @@ async function autoSeller(d, t, { ting = true } = {}) {
   }
   const c = acceptedLock(d, t);
   if (!c) return;
+  // The signed claim on Ting first is the one the buyer's page and a watchtower send: kept as this browser's, whichever browser posted it,
+  // so that a spend by it counts as the seller's own. Any other this browser signed would only conflict with it, and is given up.
+  const first = adoptSignedClaim(d, t, c, c.out);
+  if (first) {
+    const others = claimsOf(t, c.key).filter((s) => s.signed && s.txid !== first.txid && !s.dead);
+    if (others.length) {
+      const ltcClaims = { ...t.ltcClaims };
+      for (const s of others) ltcClaims[s.txid] = { ...s, dead: 'another signed claim of this lock is on Ting first' };
+      update(t, { ltcClaims });
+    }
+  }
   if (c.out.spent) {
     if (c.out.spenderConfirmed && !t.doneIn?.[d.id]) update(t, { doneIn: { ...(t.doneIn ?? {}), [d.id]: true } });
     return;
   }
   const sent = claimsOf(t, c.key);
-  // The claim signed at the accept, finished with the secret now public: the same transaction the buyer's page or a watchtower sends.
-  const ahead = sent.find((s) => s.signed && !s.hex && !s.dead);
+  // The signed claim, finished with the secret now public: the same transaction the buyer's page or a watchtower sends.
+  const ahead = first ? (first.hex || first.dead ? null : first) : sent.find((s) => s.signed && !s.hex && !s.dead);
   if (ahead) {
     await once(`ltc-claim:${c.key}`, async () => {
       let tx = null;
@@ -2075,7 +2086,7 @@ function sellerPanel(d, t, form) {
     const ahead = main && signedClaimOf(d, main, main.out);
     return panel('Waiting for the buyer to claim', `<p>${dlr(acc.amount)} are held for the buyer until ${when(acc.deadline)}.</p>
       ${waiting('Their page claims by itself. Then the LTC is claimed to your address.')}
-      ${ahead ? `<p class="hint">Your signed LTC claim is on Ting, block ${ahead.height}: once the buyer claims, their page or a watchtower can send it to <code>${esc(t.payout)}</code> for you. It pays only that address.</p>`
+      ${ahead ? `<p class="hint">Your signed LTC claim is on Ting, block ${ahead.height}: once the buyer claims, their page or a watchtower can send it to <code>${esc(claimAddress(ahead.claim) ?? t.payout)}</code> for you. It pays only that address.</p>`
         : t.signedClaimError ? `<div class="callout bad">${icon('alert')}<div><b>Your signed LTC claim is not on Ting yet:</b> ${esc(t.signedClaimError)}. Your page tries again.</div></div>` : ''}
       ${nextLine(ahead ? `If nobody sends it, your page does when you come back: come back before ${esc(localTime(acc.t1))} to be sure.` : `Keep this page open, or come back before ${esc(localTime(acc.t1))}.`)}
       ${payoutField(t, form)}
@@ -2187,16 +2198,17 @@ function sellerClaimedPanel(d, t, form) {
   if (main.out.spent && main.out.spenderConfirmed) {
     const done = claims.filter((c) => c.txid === main.out.spender);
     const got = done.reduce((s, c) => s + c.value, 0);
-    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your LTC claim paid ${ltc(got)}${usd(got)} to <code>${esc(t.payout)}</code> (after a Litecoin fee of ${ltcText(done.reduce((s, c) => s + c.fee, 0))} LTC).</p>
+    return panel('Done: you have the LTC', `<p>The buyer got ${dlr(d.claimed.paid)} on Ting, and your LTC claim paid ${ltc(got)}${usd(got)} to <code>${esc(done[0]?.to ?? t.payout)}</code> (after a Litecoin fee of ${ltcText(done.reduce((s, c) => s + c.fee, 0))} LTC).</p>
       <dl class="lines mini-lines">${lines}</dl>
       <p class="hint">Your page claimed the lock you accepted, and only that: anything else at its address stays the buyer’s.</p>
       ${app.ltcWallet ? `<p class="hint">In this test setup, see it in the <a href="${esc(app.ltcWallet)}" target="_blank" rel="noopener">Litecoin regtest wallet</a> (Alice).</p>` : ''}
       <div class="row">${shareButton(d)}</div>`, 'done');
   }
   const slow = claims.find((c) => !app.lt.txs.get(c.txid)?.confirmed && now() - (c.first ?? c.at) > SLOW_CLAIM);
-  return panel('The buyer claimed: claiming your LTC', `<p>The buyer’s claim revealed the secret on Ting in block ${d.claimed.height}. Your page uses it to claim the lock you accepted, ${ltc(main.out.value)}, to <code>${esc(t.payout)}</code>.</p>
+  const going = claims.find((c) => c.signed)?.to ?? claims[0]?.to ?? t.payout;
+  return panel('The buyer claimed: claiming your LTC', `<p>The buyer’s claim revealed the secret on Ting in block ${d.claimed.height}. Your page uses it to claim the lock you accepted, ${ltc(main.out.value)}, to <code>${esc(going)}</code>.</p>
     ${t.ltcClaimError ? `<div class="callout bad">${icon('alert')}<div><b>Litecoin refused the claim:</b> ${esc(t.ltcClaimError)}. The page tries again.</div></div>` : ''}
-    ${slow ? `<div class="callout warn">${icon('clock')}<div><b>Your LTC claim has waited ${span(now() - (slow.first ?? slow.at))} for a Litecoin block.</b> It pays ${int(slow.rate) || 'the'} litoshi per vbyte; if Litecoin’s fees rose since, it can wait a long time. This page cannot speed it up: the claim does not signal replace-by-fee, and has no output of yours to pay more from. It must be in a block before the buyer’s lock ends, ${when(d.accepted.t1)}: after that, the buyer could refund the LTC instead.</div></div>` : ''}
+    ${slow ? `<div class="callout warn">${icon('clock')}<div><b>Your LTC claim has waited ${span(now() - (slow.first ?? slow.at))} for a Litecoin block.</b> It pays ${int(slow.rate) ? `${int(slow.rate)} litoshi per vbyte` : `a fee of ${ltcText(slow.fee)} LTC`}; if Litecoin’s fees rose since, it can wait a long time. This page cannot speed it up: the claim does not signal replace-by-fee. The wallet holding <code>${esc(slow.to ?? going)}</code> can: spending the claim’s output there, unconfirmed, with a high fee pays for both (child pays for parent; Electrum-LTC offers it on an incoming transaction, Litecoin Core by spending that output by hand). An exchange’s deposit address cannot. It must be in a block before the buyer’s lock ends, ${when(d.accepted.t1)}: after that, the buyer could refund the LTC instead.</div></div>` : ''}
     <dl class="lines mini-lines">${lines}</dl>
     ${waiting(claims.length ? (app.net === 'regtest' ? 'Waiting for a Litecoin block: here, whenever the regtest chain mines.' : 'Waiting for a Litecoin block: about 2.5 minutes.') : 'Building and sending the claim…')}`, 'act');
 }
@@ -2654,12 +2666,14 @@ async function accept(id, index) {
   if (app.lt.error || app.lt.failed.has(outKey(take.lockOf))) throw new Error(`Cannot check the lock on Litecoin: ${app.lt.error ?? app.lt.failed.get(outKey(take.lockOf))}`);
   const c = checkTake(listing, take);
   if (c.state !== 'ok') throw new Error(`Not accepting: ${c.words}.`);
+  // A signed claim of this lock already on Ting, from another browser with this backup code, is the one: it is kept, not signed again.
+  const adopted = adoptSignedClaim(d, d.seller, c.lock, c.out);
   if (!d.seller.payout) throw new Error('Enter your Litecoin payout address first: your page signs the claim of your LTC to it as you accept.');
   // Another accept link may still be approved: say what a second one means before showing it.
   const others = Object.keys(d.seller.accepting ?? {}).filter((k) => k !== outKey(take.lockOf) && d.takes.some((x) => x.lockOf && outKey(x.lockOf) === k));
   if (others.length && !(await askSecondLink(d, others))) throw new Quiet();
   // The claim, signed now, goes on Ting before the accept: once the buyer claims, it can be sent without this page.
-  if (!signedClaimSent(d.seller, outKey(take.lockOf))) {
+  if (!adopted && !signedClaimSent(d.seller, outKey(take.lockOf))) {
     try {
       await postSignedClaim(d, take);
     } catch (e) {
@@ -2731,7 +2745,7 @@ async function postSignedClaim(d, take, t = d.seller) {
     ltcClaims: {
       ...(t.ltcClaims ?? {}),
       [signed.claim]: {
-        txid: signed.claim, fee: signed.fee, value: signed.out.value, rate, key: outKey(lock), listing: d.id,
+        txid: signed.claim, fee: signed.fee, value: signed.out.value, rate, key: outKey(lock), listing: d.id, to: t.payout,
         signed: { id, data: hex(data), posted: now() },
       },
     },
@@ -2739,20 +2753,60 @@ async function postSignedClaim(d, take, t = d.seller) {
   return id;
 }
 
+/** The address a signed claim pays, on this page's network; null for a script with none. */
+function claimAddress(claim) {
+  try {
+    return L.scriptToAddress(claim.out.script, app.net);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Posts the signed claim of the accepted lock while the buyer has not claimed:
- * once, if this browser has none for it (a trade restored from a backup code,
- * whose payout address came later, or an accept made before signed claims),
- * and again, the same data, if the node no longer knows the posting and the
- * claim is not on Ting.
+ * The signed claim of a lock that is on Ting first, verifying against the
+ * listing's key (signedClaimOf), kept among the trade's claims as this
+ * browser's own: the one the buyer's page and a watchtower send. Another
+ * browser with the same backup code, or this one when its own posting came
+ * second, so sends the same transaction rather than a second one spending the
+ * same lock, and names the address the claim really pays. A trade with no
+ * payout address takes it from the claim, which signed that address in at the
+ * accept. The record, or null when no signed claim of the lock is on Ting.
+ */
+function adoptSignedClaim(d, t, lock, out) {
+  const s = signedClaimOf(d, lock, out);
+  if (!s) return null;
+  const txid = L.signedClaimTxid(s.claim);
+  const to = claimAddress(s.claim);
+  const fields = t.payout || !to ? {} : { payout: to };
+  if (!t.ltcClaims?.[txid]) {
+    fields.ltcClaims = {
+      ...(t.ltcClaims ?? {}),
+      [txid]: {
+        txid, fee: out.value - s.claim.out.value, value: s.claim.out.value, rate: null, key: outKey(lock), listing: d.id, to,
+        signed: { id: s.tx, data: hex(s.data), posted: s.time, adopted: true },
+      },
+    };
+  }
+  if (Object.keys(fields).length) update(t, fields);
+  return t.ltcClaims[txid];
+}
+
+/**
+ * Keeps a signed claim of the accepted lock on Ting while the buyer has not
+ * claimed. One verifying claim there is enough, whichever browser posted it:
+ * it is adopted, not signed again. With none, this browser posts its own once
+ * (a trade restored from a backup code, whose payout address came later, or an
+ * accept made before signed claims), and again, the same data, if the node no
+ * longer knows the posting.
  */
 async function keepSignedClaim(d, t, c) {
+  if (adoptSignedClaim(d, t, c, c.out) || !t.payout) return;
   const own = signedClaimSent(t, c.key);
   if (!own) {
     await once(`signed-claim:${c.key}`, () => postSignedClaim(d, acceptedTake(d, t), t).then(() => update(t, { signedClaimError: null })).catch((e) => update(t, { signedClaimError: e.message })));
     return;
   }
-  if (signedClaimOf(d, c, c.out) || now() - (own.signed.posted ?? 0) < RESEND_AFTER) return;
+  if (now() - (own.signed.posted ?? 0) < RESEND_AFTER) return;
   const s = await tingTx(own.signed.id).catch(() => null);
   if (s?.state !== 'missing') return;
   await once(`signed-claim:${c.key}`, async () => {
