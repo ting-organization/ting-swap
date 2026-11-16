@@ -2681,9 +2681,13 @@ async function accept(id, index) {
     }
   }
   update(d.seller, { accepting: { ...(d.seller.accepting ?? {}), [outKey(take.lockOf)]: { at: now(), index } } });
+  // The address was signed in by whichever browser posted the claim first: said before the link, when it is not this one's.
+  const elsewhere = adopted?.to && adopted.to !== d.seller.payout
+    ? `<div class="callout warn">${icon('alert')}<div>Your signed claim of this lock is already on Ting, from another browser with your backup code. <b>The LTC goes to <code>${esc(adopted.to)}</code></b>, the address signed in there, not to <code>${esc(d.seller.payout)}</code>.</div></div>`
+    : '';
   await perform({
     call: H.acceptCall(listing, take), feeCoin: app.coin, label: `Accept the lock for listing #${id}`,
-    notes: `<p class="hint">Checked on Litecoin just now: ${esc(c.words)}. Ting ID shows the buyer’s account and the hash shortened, and the time their lock ends.</p>`,
+    notes: `${elsewhere}<p class="hint">Checked on Litecoin just now: ${esc(c.words)}. Ting ID shows the buyer’s account and the hash shortened, and the time their lock ends.</p>`,
     done: (ok, executed) => { if (ok) pinFromCall(d.seller, id, executed); app.onData?.(); },
   });
 }
