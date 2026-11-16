@@ -1070,10 +1070,31 @@ function takeOfBuyer(d, t) {
     && equal(x.lockOf.buyer, m.pub) && (!posted?.txid || (x.lockOf.txid === posted.txid && x.lockOf.vout === posted.vout))) ?? null;
 }
 
+/**
+ * The lock the buyer's claim on Ting was for, once that claim is in: its
+ * secret is public then, and the lock the seller's to claim however late, so
+ * the buyer's refund never takes it, even after T1. Null before the claim.
+ */
+function claimedLock(d, t) {
+  if (!d.claimed) return null;
+  const take = takeOfBuyer(d, t);
+  return take && matchesAccept(take, d.accepted) ? take.lockOf : null;
+}
+
+/** What the buyer's refund takes back: every output in a block at the lock address but the claimed lock. */
+function refundable(d, t) {
+  const claimed = claimedLock(d, t);
+  const key = claimed ? outKey(claimed) : null;
+  return (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed && outKey(u) !== key);
+}
+
 /** The buyer's Litecoin release or refund, sent again while the explorer does not know it: one an explorer lost. */
-async function resendLtc(t) {
+async function resendLtc(d, t) {
+  const claimed = claimedLock(d, t);
   for (const sent of [t.releaseTx, ...Object.values(t.refundTxs ?? {})]) {
     if (!sent?.hex) continue;
+    // A refund that spends the claimed lock would take the seller's LTC: it is never sent again.
+    if (claimed && sent.covers?.includes(outKey(claimed))) continue;
     const s = app.lt.txs.get(sent.txid);
     if (!s || s.found || now() - sent.at < RESEND_AFTER) continue;
     await once(`resend:${sent.txid}`, async () => {
@@ -1100,7 +1121,7 @@ async function resendLtc(t) {
  * again while the explorer does not know it.
  */
 async function autoBuyer(d, t, { ltc = true, ting = true } = {}) {
-  if (ltc) await resendLtc(t);
+  if (ltc) await resendLtc(d, t);
   if (!ting) return;
   const m = marksOf(t.n);
   const take = takeOfBuyer(d, t);
@@ -2274,7 +2295,7 @@ function refundBlock(d, t, form, afterT1, { quiet = false, field = true } = {}) 
     return `<div><dt>Refund on Litecoin</dt><dd>${txid(r.txid)} <span class="muted">${ltcText(r.value)} LTC · ${where}</span></dd></div>`;
   }).join('')}</dl>` : '';
   const known = app.lt.utxos.has(t.address);
-  const left = (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed);
+  const left = refundable(d, t);
   if (known && !left.length) return lines;
   if (!afterT1) return lines + (quiet ? '' : nextLine(`After ${esc(localTime(t.t1))} (Litecoin goes by the median time of its last 11 blocks), a “Refund my LTC” button appears here.`));
   return `${lines}${field ? addressField(t, form) : ''}<div class="row"><button class="primary" data-refund-ltc>${icon('undo')} Refund my LTC</button></div>`;
@@ -2669,8 +2690,8 @@ async function refundLtc(id, form) {
   await refreshLtc({ addresses: [t.address] });
   if (app.lt.error || app.lt.failed.has(t.address)) throw new Error(`Cannot read your lock address on Litecoin: ${app.lt.error ?? app.lt.failed.get(t.address)}`);
   if (!(app.lt.tip?.mtp > t.t1)) throw new Error(`Not yet: Litecoin’s median time has not passed ${localTime(t.t1)}.`);
-  const utxos = (app.lt.utxos.get(t.address) ?? []).filter((u) => u.status.confirmed);
-  if (!utxos.length) throw new Error('Nothing in a block is left at your lock address.');
+  const utxos = refundable(d, t);
+  if (!utxos.length) throw new Error(claimedLock(d, t) ? 'Nothing in a block at your lock address is yours to refund: the lock your claim was for is the seller’s.' : 'Nothing in a block is left at your lock address.');
   const m = marksOf(t.n);
   const htlc = { tag: L.lockTag(app.program, id, unhex(t.receive)), hash: m.hash, seller: d.terms.key, buyer: m.pub, t1: t.t1 };
   if (L.lockOutput(htlc, app.net).address !== t.address) throw new Error('The lock rebuilt from this trade is not the address you paid: not refunding.');
