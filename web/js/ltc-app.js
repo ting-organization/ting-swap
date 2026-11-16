@@ -223,12 +223,36 @@ const rateBack = (amount, want) => `1 LTC = ${rate(BigInt(want), 8, BigInt(amoun
 /** The LTC price while it is recent enough to show, or null. */
 const livePrice = () => (app.price && now() - app.price.time <= PRICE_AGE ? app.price : null);
 
-/** "≈ $21.95" for an LTC amount in litoshi, or nothing without a recent price. LTC only: never for DLR. */
+/** "≈ $21.95" for an LTC amount in litoshi, or nothing without a recent price. LTC only: a DLR amount has no price of its own (rateUsd gives what a listing's rate makes of one). */
 function usd(litoshi) {
   const p = livePrice();
   if (!p) return '';
   const value = (Number(BigInt(litoshi)) / 1e8) * p.usd;
   return `<span class="usd">≈ $${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>`;
+}
+
+/** A USD amount: two decimals from a dollar up, three significant digits below, as a DLR's often is. */
+const dollars = (v) => (v >= 1
+  ? v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  : v.toLocaleString('en-US', { maximumSignificantDigits: 3 }));
+
+/**
+ * What one DLR comes to in USD at a listing's rate: its LTC per DLR times LTC's
+ * price, or null without a recent price. An estimate from the listing, not a
+ * price DLR has anywhere.
+ */
+function dlrInUsd(amount, want) {
+  const p = livePrice();
+  if (!p || BigInt(amount) <= 0n) return null;
+  return ((Number(BigInt(want)) / 1e8) * p.usd) / (Number(BigInt(amount)) / 10 ** app.dlr.decimals);
+}
+
+/** "1 DLR ≈ $0.00126" at a listing's rate, or nothing without a recent price; `per` gives "≈ $0.00126 / DLR". */
+function rateUsd(amount, want, { per = false } = {}) {
+  const v = dlrInUsd(amount, want);
+  if (v == null) return '';
+  const text = per ? `≈ $${dollars(v)} / ${esc(app.dlr.symbol)}` : `1 ${esc(app.dlr.symbol)} ≈ $${dollars(v)}`;
+  return `<span class="usd" title="${esc(`At this rate and LTC’s price. ${usdNote()}`)}">${text}</span>`;
 }
 
 /** Where the USD estimates come from, in a sentence, or '' when the page shows none. */
@@ -1667,7 +1691,7 @@ function marketRow(l) {
     <a class="listing-link" href="#/l/${l.id}" aria-label="Listing ${l.id}"></a>
     <div class="leg get"><span class="label">You get</span>${dlr(l.amount)}</div>
     <div class="leg pay"><span class="label">You pay</span>${ltc(l.want)}${usd(l.want)}</div>
-    <div class="leg rate"><span class="label">Rate</span><span class="rate-text">${rateText(l.amount, l.want)}</span></div>
+    <div class="leg rate"><span class="label">Rate</span><span class="rate-text">${rateText(l.amount, l.want)}</span>${rateUsd(l.amount, l.want)}</div>
     <div class="leg meta"><span class="label">#${l.id} · held ${span(l.window)} once accepted</span><span class="meta-line">${yours ? '<span class="badge mine">Your listing</span>' : who(l.maker)}${forOne ? `<span class="badge for-one" title="Only ${hex(l.taker)} can take it">For one buyer</span>` : ''}${locks ? `<span class="badge taken">${plural(locks, 'lock')}</span>` : ''}${refused ? `<span class="badge refused" title="${esc(refused)}">Not buyable here</span>` : ''}</span></div>
     <div class="leg act">${yours ? `<a class="button" href="#/l/${l.id}">Open</a>` : refused ? `<a class="button" href="#/l/${l.id}">View</a>` : `<a class="button primary" href="#/l/${l.id}">Buy with LTC</a>`}</div>
   </article>`;
@@ -1707,7 +1731,7 @@ function renderMarket(main) {
       <dl class="stats">
         <div><dt>Open listings</dt><dd>${app.loaded ? ours.length.toLocaleString() : '…'}</dd></div>
         <div><dt>Swaps done</dt><dd>${swaps.toLocaleString()}</dd></div>
-        <div><dt>Best rate</dt><dd class="small">${best ? `${rate(best.want, 8, best.amount, app.dlr.decimals, 5)} ${esc(app.dlr.symbol)}<span class="muted"> / LTC</span>` : '—'}</dd></div>
+        <div><dt>Best rate</dt><dd class="small">${best ? `${rate(best.want, 8, best.amount, app.dlr.decimals, 5)} ${esc(app.dlr.symbol)}<span class="muted"> / LTC</span>${rateUsd(best.amount, best.want, { per: true })}` : '—'}</dd></div>
         <div><dt>Your trades</dt><dd>${trades.length.toLocaleString()}</dd></div>
       </dl>
       ${trades.length ? `<section class="board my-trades">
@@ -1852,7 +1876,7 @@ function renderSell(main) {
       return;
     }
     const call = H.offerCall({ taker: v.taker, chain: 'LTC', want: v.want, key: publicKey(new Uint8Array(32).fill(1)), window: v.hours * 3600, coin: app.coin, fee: v.fee ?? 0n });
-    box.innerHTML = `<div class="preview-line"><span class="label">Rate</span><b>${rateText(v.amount, v.want)}</b></div>
+    box.innerHTML = `<div class="preview-line"><span class="label">Rate</span><b>${rateText(v.amount, v.want)}</b>${rateUsd(v.amount, v.want, { per: true })}</div>
       <div class="preview-line"><span class="label">Network fee</span><span>${dlr(v.fee)} <span class="muted">${!app.claimRate ? '· the least, as nothing paid fees lately' : twoDigits(FEE_MARGIN * app.claimRate) >= v.fee ? `· ${FEE_MARGIN}× what a claim pays now, paid by the buyer’s claim` : `· the least the page sets: a claim pays about ${dlrText(app.claimRate)} ${esc(app.dlr.symbol)} now`}</span></span></div>
       ${v.problems.length ? `<p class="hint error">${esc(v.problems.join(' '))}</p>` : ''}
       <details class="owner tech"><summary>What Ting ID will show</summary><p class="wallet-preview">${walletSentence(call.template, call.values, { amount: v.amount }, { key: '<b class="placeholder">33 bytes</b>' })}</p></details>`;
@@ -1988,7 +2012,7 @@ function tradeHtml(id, form) {
     <div class="detail-grid">
       <section class="ticket trade-ticket">
         <header><div><div class="eyebrow">Listing #${l.id} · ${roleChip}</div><h1>${dlr(l.amount)}</h1><p class="muted">for ${ltc(l.want)}${usd(l.want)}</p></div>${status}</header>
-        <p class="hint terms-line">${rateText(l.amount, l.want)} · held ${span(l.window)} once accepted${H.isZero(l.taker) ? '' : ` · only for ${who(l.taker)}`}</p>
+        <p class="hint terms-line">${rateText(l.amount, l.want)}${rateUsd(l.amount, l.want, { per: true })} · held ${span(l.window)} once accepted${H.isZero(l.taker) ? '' : ` · only for ${who(l.taker)}`}</p>
         ${role === 'watcher' ? endedBanner(d) : ''}
         ${role === 'watcher' && copiedBy(id) ? copyNote(copiedBy(id), form) : ''}
         ${role === 'seller' && !pinned(d.seller) && (d.seller.listings?.length ?? 0) > 1 ? whichIsYours(d.seller, form) : ''}

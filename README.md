@@ -88,8 +88,9 @@ the real browser first.
 
 **For trading over chat.** *Copy for sharing* copies an overview of the trade for a
 chat: the amounts, the LTC in dollars at litecoinspace.org's price, where the trade
-stands, and its link. It never holds a key or the secret, and the page never gives DLR
-a dollar value.
+stands, and its link. It never holds a key or the secret. DLR gets a dollar figure only
+next to a listing's rate (1 DLR ≈ $…): that listing's LTC per DLR at LTC's price, an
+estimate from the listing, not a price DLR has anywhere.
 
 ## Layout
 
