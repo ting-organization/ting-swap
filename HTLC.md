@@ -391,11 +391,12 @@ computer.
   `t1` leaves the program's gap and 10 minutes more. It shows the result for each take,
   and offers the accept, a call link, only for a take that passes, checked again at the
   click. It accepts only with a payout address (a trade restored from a backup code asks
-  for it again), since it signs the claim to it: at the click, before it shows the accept
-  link, it posts that lock's signed claim on Ting, and does not show the link if it
-  cannot. Until the buyer claims, it posts the accepted lock's signed claim if it has
-  none for it, and posts the same data again if the node lost the posting and it is not
-  on Ting.
+  for it again, or takes it from a signed claim of the lock already on Ting), since it
+  signs the claim to it: at the click, before it shows the accept link, it posts that
+  lock's signed claim on Ting, unless one verifying is there already, and does not show
+  the link if it cannot. Until the buyer claims, it keeps one on Ting: it adopts one
+  verifying that is there, whichever browser with the backup code posted it, posts its
+  own if there is none, and posts the same data again if the node lost the posting.
 - **Accepts and releases.** A release lets a buyer take the lock back; an accept holds
   the DLR for them. Both for one lock would give the buyer both sides. The seller's page
   refuses to accept a lock it released or sent a release of, and notes which lock each
@@ -437,15 +438,20 @@ computer.
   address, an underpayment, a second payment, dust, is the buyer's, though the secret
   opens it too once it is public. A dust take or a copy of the take cannot get in the
   way, since nothing else is in the transaction. The listing is done once that output is
-  spent in a block, whoever sent the claim. The page keeps its signed claim among its
-  claims, by the claim's txid, which the secret does not change: it finishes and sends
-  that one first, the same transaction the buyer's page or a watchtower sends, and builds
-  a claim of its own, at the rate of the moment, only if it has no signed claim or
-  Litecoin refused it. The page sends a claim again while the explorer does not know it,
-  gives up one Litecoin refuses outright and claims anew, and warns when a claim has
-  waited more than 30 minutes for a block: it cannot be sped up (it does not signal
-  replace-by-fee, and has no output of the seller's to pay more from), and it must be in
-  a block before T1. The claim, and sending it again, need only the claimed event the
+  spent in a block, whoever sent the claim. The page keeps the signed claim of the lock
+  that is on Ting first, verifying against the listing's key, among its claims, by the
+  claim's txid, which the secret does not change, whichever browser with the backup code
+  posted it: a second browser adopts it rather than signing another, which would spend
+  the same lock, and takes its payout address from it. The page finishes and sends that
+  one, the same transaction the buyer's page or a watchtower sends, gives up any other
+  it signed, and builds a claim of its own, at the rate of the moment, only if there is
+  no signed claim or Litecoin refused it. The page sends a claim again while the
+  explorer does not know it, gives up one Litecoin refuses outright and claims anew, and
+  warns when a claim has waited more than 30 minutes for a block. It must be in a block
+  before T1. The page cannot speed it up, since it does not signal replace-by-fee, but
+  the wallet holding the payout address can: spending the claim's output, unconfirmed,
+  with a high fee pays for both (child pays for parent). An exchange's deposit address
+  cannot, and the warning says so. The claim, and sending it again, need only the claimed event the
   page already read and Litecoin: they go out while the page's Ting node cannot be
   reached.
 - **The way back.** After the deadline anyone may send the refund on Ting; the page offers
@@ -520,7 +526,9 @@ What is left before it is published:
   `<seller> OP_CHECKSIG` in the claim branch: once that lock's secret is public, anyone
   can sweep a released lock its buyer has not taken back, to anywhere. Unique secrets
   prevent it (one counter, one trade); a version 2 script could separate the branches.
-- **Fee bumping.** An LTC claim cannot be sped up: it does not signal replace-by-fee, and
-  has no output of the seller's for a child to pay more from. The page warns after 30
-  minutes, but a claim stuck past T1 can be refunded by a buyer who builds the refund
+- **Fee bumping.** An LTC claim does not signal replace-by-fee, and its fee is fixed when
+  the seller's page signs it at the accept, up to 7 days before it goes out. Only the
+  wallet holding the payout address can speed it up, by child pays for parent; the page
+  warns after 30 minutes and says how, but a seller paid to an exchange's deposit address
+  has no way, and a claim stuck past T1 can be refunded by a buyer who builds the refund
   outside the page.

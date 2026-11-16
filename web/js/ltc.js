@@ -781,6 +781,9 @@ export function signClaim({ key, ...lock }) {
   return { txid: input.txid, vout: input.vout, out, signature, fee: spent.fee, claim: txid(spent.tx) };
 }
 
+/** The txid of the claim of the lock `txid:vout` into `out`, as signClaim signs it: the same once the secret is in, since the witness does not count. */
+export const signedClaimTxid = ({ txid: lockTxid, vout, out }) => txid(claimShell({ txid: lockTxid, vout, out }));
+
 /** Whether `signature` is the seller's SIGHASH_ALL signature of the claim of the lock `txid:vout` of `value` into `out`, low S and all. */
 export function verifyClaimSignature({ txid: lockTxid, vout, value, htlc, out, signature }) {
   const script = htlcScript(htlc);

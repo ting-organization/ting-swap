@@ -1110,6 +1110,7 @@ group('spending the lock', () => {
   const ahead = L.signClaim({ ...lock, key: SELLER });
   check(ahead.txid === LOCK_TXID && ahead.vout === VOUT && hex(ahead.out.script) === hex(L.addressToScript(to, 'regtest')) && ahead.out.value + ahead.fee === VALUE, 'signed claim: the lock, one output to the address, and the fee');
   check(ahead.claim === claim.txid, 'signed claim: the claim\'s txid, known before the secret is in');
+  check(L.signedClaimTxid(L.decodeSignedClaim(L.encodeSignedClaim(ahead))) === claim.txid, 'signed claim: its txid from its release data alone');
   check(L.encodeSignedClaim(ahead).length <= 256, 'signed claim: its release data fits the program\'s 256 bytes');
   const claimOk = (changes = {}) => L.verifyClaimSignature({ txid: LOCK_TXID, vout: VOUT, value: VALUE, htlc: HTLC, out: ahead.out, signature: ahead.signature, ...changes });
   check(claimOk(), 'signed claim: the signature checks');
