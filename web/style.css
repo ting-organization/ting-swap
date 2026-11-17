@@ -240,11 +240,11 @@ main { flex: 1; width: 100%; max-width: var(--page); margin: 0 auto; padding: 28
 button.pill { min-height: 30px; padding: 4px 10px; }
 .toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); cursor: pointer; user-select: none; }
 
-.list, .trade-rows, .column {
+.list, .trade-rows, .swap-rows, .column {
   display: flex; flex-direction: column; background: var(--surface);
   border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
 }
-.list > * + *, .trade-rows > * + *, .column > .listing + .listing { border-top: 1px solid var(--border); }
+.list > * + *, .trade-rows > * + *, .swap-rows > * + *, .column > .listing + .listing { border-top: 1px solid var(--border); }
 .book { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 .column > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface-2); border-bottom: 1px solid var(--border); }
 .column > header h2 { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 14px; }
@@ -533,6 +533,28 @@ a.trade-row:hover { text-decoration: none; background: var(--hover); }
 
 .ltc-row .meta-line { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
+/* Recent swaps, under the listings: what for what, the rate in the listings' rate column, and when. */
+.swaps { margin-top: 28px; }
+.swap-row, .swap-head {
+  display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.2fr) minmax(0, 1.15fr) minmax(0, 1.2fr) 120px;
+  grid-template-areas: "what what rate when id"; gap: 16px; align-items: center; padding: 10px 16px; color: var(--text);
+}
+.swap-head { padding-top: 8px; padding-bottom: 8px; background: var(--surface-2); color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; }
+.swap-head > :nth-child(1) { grid-area: what; }
+.swap-head > :nth-child(2) { grid-area: rate; }
+.swap-head > :nth-child(3) { grid-area: when; }
+a.swap-row:hover { text-decoration: none; background: var(--hover); }
+.swap-row .what { grid-area: what; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.swap-row .amt { font-size: 14px; }
+.swap-rate { grid-area: rate; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0; }
+.swap-rate .rate-text { font-size: 13px; color: var(--text-2); }
+.swap-rate .usd { margin-left: 0; font-size: 12px; }
+.swap-when { grid-area: when; display: flex; flex-direction: column; gap: 1px; font-size: 13px; color: var(--text-2); min-width: 0; }
+.swap-when .at { color: var(--muted); font-size: 12px; }
+.swap-id { grid-area: id; color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+.swap-note { margin: 0; font-size: 12.5px; }
+.swap-empty { display: flex; align-items: center; gap: 10px; padding: 16px; font-size: 13px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+
 .unit-tag { display: inline-flex; align-items: center; flex: none; padding: 4px 10px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); font-size: 13px; font-weight: 600; letter-spacing: .04em; }
 .wide-field { width: 100%; margin-top: 6px; }
 .wide-field .hint { margin-top: 0; }
@@ -668,7 +690,15 @@ button.copy .icon { width: 14px; height: 14px; vertical-align: 0; }
   .trade-row, .trade-row.pending { grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; }
   .trade-row .step, .trade-row .row { grid-column: 1 / -1; }
 }
+@media (max-width: 980px) {
+  .swap-head { display: none; }
+  .swap-row { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 140px; grid-template-areas: "what rate when"; }
+  .swap-id { display: none; }
+}
 @media (max-width: 560px) {
+  .swap-row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "what when" "rate when"; gap: 4px 12px; padding: 12px 14px; }
+  .swap-when { align-items: flex-end; align-self: start; font-size: 12.5px; }
+  .swap-when .at { display: none; }
   .ltc-page nav a { padding: 0 7px; }
   .form-grid { grid-template-columns: 1fr; }
   .lockbox { grid-template-columns: 1fr; justify-items: stretch; }
