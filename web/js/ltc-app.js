@@ -108,6 +108,10 @@ const SIGNED_CLAIM_RATE = 10;
 const OTHER_READS = 8;
 /** An output Litecoin did not have, read again after this long; one that pays another script never again. */
 const MISSING_AGAIN = 300;
+/** The market lists this many swaps, newest first. */
+const RECENT_SWAPS = 10;
+/** Locks of swaps the market has yet to check, read at most this many per round, on top of a trade's own reads. */
+const SWAP_READS = 4;
 /** Inside Discord's own browser, which can lose what a page keeps. */
 const DISCORD = /discord/i.test(navigator.userAgent);
 /**
@@ -165,6 +169,8 @@ const app = {
   /** What the current view does every second, when data changes, and what it reads every few seconds. */
   tick: null,
   onData: null,
+  /** Whether the market is on screen: it alone checks recent swaps on Litecoin. */
+  market: false,
   reader: null,
   leave: null,
   /** Actions in flight, so that none starts twice. */
@@ -1452,15 +1458,17 @@ function ltcEvery(active) {
 
 /**
  * Whether this round reads Litecoin: when asked to, when something `first`
- * names was never read (nor failed), or when the last read is ltcEvery old;
- * never sooner than LTC_MIN_GAP after it. Ting is read every round.
+ * names, or an output of `rest` (a take, a recent swap's lock), was never read
+ * (nor failed), or when the last read is ltcEvery old; never sooner than
+ * LTC_MIN_GAP after it. `rest` is capped per round, so this is too. Ting is
+ * read every round.
  */
-function ltcDue(first, active) {
+function ltcDue(first, active, rest = []) {
   if (app.lt.force) return true;
   const since = now() - app.lt.at;
   if (since < LTC_MIN_GAP) return false;
   const unread = (key, map) => !map.has(key) && !app.lt.failed.has(key);
-  if (first.outs.some(([txidHex, vout]) => unread(`${txidHex}:${vout}`, app.lt.outs))) return true;
+  if ([...first.outs, ...rest].some(([txidHex, vout]) => unread(`${txidHex}:${vout}`, app.lt.outs))) return true;
   if (first.txs.some((id) => unread(id, app.lt.txs)) || first.addresses.some((a) => unread(a, app.lt.utxos))) return true;
   return since >= ltcEvery(active);
 }
@@ -1524,8 +1532,12 @@ async function round() {
     addresses: [...new Set(firsts.flatMap((f) => f.addresses))],
     txs: [...new Set(firsts.flatMap((f) => f.txs))].filter((id) => !(app.lt.txs.get(id)?.confirmed && ltcDepth(app.lt.txs.get(id).height) >= SETTLED_DEPTH)),
   };
+  const rest = new Map();
+  for (const [txidHex, vout] of [...pickRest(rests), ...(app.market ? pickRest(recentSwaps().due, SWAP_READS) : [])]) {
+    if (!outs.has(`${txidHex}:${vout}`)) rest.set(`${txidHex}:${vout}`, [txidHex, vout]);
+  }
   const active = jobs.length > 0 || app.viewing != null;
-  if (ltcDue(first, active)) await refreshLtc(first, { outs: pickRest(rests).filter(([txidHex, vout]) => !outs.has(`${txidHex}:${vout}`)) });
+  if (ltcDue(first, active, [...rest.values()])) await refreshLtc(first, { outs: [...rest.values()] });
   app.readEvery = active ? TRADE_POLL : MARKET_POLL;
   if (!K.seed()) return;
   const tingRead = !app.tingError;
@@ -1589,6 +1601,7 @@ function route() {
   app.onData = null;
   app.viewing = null;
   app.onPrice = null;
+  app.market = false;
   const [, view, arg] = location.hash.split('/');
   $$('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === (view || 'market')));
   const main = $('#view');
@@ -1685,8 +1698,91 @@ function marketRow(l) {
   </article>`;
 }
 
+/**
+ * Whether a claimed listing's LTC was really locked: a take matching the
+ * accept whose output Litecoin has in a block, paying the script rebuilt from
+ * the take at least the LTC wanted. The program never sees Litecoin, so a
+ * seller could accept a take that names no LTC and claim it themselves, a swap
+ * at any rate for a few Ting fees: the market lists a swap only once its LTC
+ * checks. `{ state: 'ok' | 'checking' | 'bad', due }`, `due` the locks still
+ * worth reading for it. A lock only a backup explorer has not seen is still
+ * being checked: it leaves no swap out.
+ */
+function swapCheck(d) {
+  let state = 'bad';
+  const due = [];
+  for (const take of d.takes) {
+    if (!matchesAccept(take, d.accepted)) continue;
+    const lock = lockScript(d.terms, take);
+    if (!lock) continue;
+    const o = outOf(lock.txid, lock.vout);
+    const pays = Boolean(o && !o.missing && o.script === hex(lock.scriptPubKey) && BigInt(o.value) >= BigInt(d.terms.want));
+    if (pays && o.confirmed) return { state: 'ok', due: [] };
+    if (!o || pays || (o.missing && !o.trusted)) state = 'checking';
+    if (!o || o.missing || pays) due.push(lock);
+  }
+  return { state, due };
+}
+
+/**
+ * The market's recent swaps: the newest claims of DLR-for-LTC listings, up to
+ * RECENT_SWAPS whose LTC checks (`shown`), and of the newer claims how many
+ * are still being checked and how many were left out; `due`, the locks to read
+ * for them, which round() reads SWAP_READS at a time.
+ */
+function recentSwaps() {
+  const claims = app.events.filter((e) => e.kind === 'claimed').sort((a, b) => b.height - a.height || b.id - a.id);
+  const shown = [];
+  const due = [];
+  let checking = 0;
+  let left = 0;
+  for (const claim of claims) {
+    if (shown.length >= RECENT_SWAPS) break;
+    const d = tradeOf(claim.id);
+    if (!d.terms || !forThisPage(d.terms) || !d.accepted) continue;
+    const c = swapCheck(d);
+    if (c.state === 'ok') shown.push({ d, claim });
+    else if (c.state === 'checking') checking += 1;
+    else left += 1;
+    due.push(...c.due);
+  }
+  return { shown, checking, left, due };
+}
+
+function swapRow({ d, claim }) {
+  const l = d.terms;
+  return `<a class="swap-row" href="#/l/${d.id}">
+    <span class="what">${dlr(l.amount)} <span class="muted">for</span> ${ltc(l.want)}</span>
+    <span class="swap-rate"><span class="rate-text">${rateText(l.amount, l.want)}</span>${rateUsd(l.amount, l.want)}</span>
+    <span class="swap-when"><time data-at="${claim.time}">${esc(relative(claim.time))}</time><span class="at">${esc(localTime(claim.time))}</span></span>
+    <span class="swap-id">#${d.id}</span>
+  </a>`;
+}
+
+function swapsHtml() {
+  if (!app.loaded) return '';
+  const s = recentSwaps();
+  let body;
+  if (s.shown.length) {
+    const notes = [];
+    if (s.checking) notes.push(app.lt.error ? `${plural(s.checking, 'newer swap')} not checked yet: Litecoin cannot be read right now` : `Checking ${plural(s.checking, 'newer swap')} on Litecoin…`);
+    if (s.left) notes.push(`${plural(s.left, 'claim')} left out: no LTC was locked for ${s.left === 1 ? 'it' : 'them'} on Litecoin`);
+    body = `<div class="swap-rows"><div class="swap-head" aria-hidden="true"><span>Swapped</span><span>Rate</span><span>When</span></div>${s.shown.map(swapRow).join('')}</div>${notes.length ? `<p class="swap-note muted">${notes.join(' · ')}</p>` : ''}`;
+  } else if (s.checking) {
+    body = `<div class="swap-empty muted">${app.lt.error ? 'Cannot read Litecoin right now to check the swaps.' : '<span class="spinner"></span> Checking the swaps on Litecoin…'}</div>`;
+  } else {
+    body = `<div class="swap-empty muted">No swaps yet${s.left ? `: ${plural(s.left, 'claim')} left out, no LTC was locked for ${s.left === 1 ? 'it' : 'them'} on Litecoin` : ''}.</div>`;
+  }
+  return `<section class="board swaps">
+    <header class="section-head"><h2>Recent swaps</h2><span class="muted">Newest first · each one’s LTC seen locked on Litecoin</span></header>
+    ${body}
+  </section>`;
+}
+
 function renderMarket(main) {
   main.className = 'market';
+  app.market = true;
+  app.tick = tickTimes;
   const draw = () => {
     const open = [...app.listings.values()];
     const ours = open.filter(forThisPage).sort((a, b) => {
@@ -1694,7 +1790,8 @@ function renderMarket(main) {
       return x < y ? -1 : x > y ? 1 : a.id - b.id;
     });
     const others = open.length - ours.length;
-    const swaps = app.events.filter((e) => e.kind === 'claimed').length;
+    const listed = new Map(app.events.filter((e) => e.kind === 'listed').map((e) => [e.id, e]));
+    const swaps = app.events.filter((e) => e.kind === 'claimed' && listed.has(e.id) && forThisPage(listed.get(e.id))).length;
     const best = ours[0];
     const trades = myTrades().slice().sort((a, b) => (b.created ?? 0) - (a.created ?? 0));
     let book;
@@ -1747,7 +1844,8 @@ function renderMarket(main) {
       <section class="board">
         <header class="section-head"><h2>DLR for LTC</h2><span class="muted">Best rate first${others ? ` · ${plural(others, 'other listing')} for other coins or chains not shown` : ''}</span></header>
         ${book}
-      </section>`, () => wireCommon(main));
+      </section>
+      ${swapsHtml()}`, () => wireCommon(main));
   };
   draw();
   app.onData = draw;
