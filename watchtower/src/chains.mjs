@@ -1,6 +1,6 @@
-// Reading Ting and Litecoin, the way the page does (HTLC.md, "Reading"), and
-// sending what the watchtower sends: the program's own refund input on Ting,
-// and finished claims on Litecoin.
+// Reading Ting the way the page does (HTLC.md, "Reading"), and sending the
+// program's own refund input on Ting. Litecoin, read and sent to through the
+// same explorers as the page, is web/js/explorer.js's.
 import { hex, Reader, unhex } from '../../web/js/bytes.js';
 import * as H from '../../web/js/htlc.js';
 import { Node, NodeError } from '../../web/js/ting.js';
@@ -76,96 +76,6 @@ export class Ting {
     } catch (e) {
       if (e instanceof NodeError && e.status === 404) return 'missing';
       throw e;
-    }
-  }
-}
-
-export class ExplorerError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.status = status;
-  }
-}
-
-/** The part of an Esplora API the watchtower reads: litecoinspace.org, or scripts/ltc-dev.mjs on regtest. */
-export class Litecoin {
-  constructor(base) {
-    this.base = base.replace(/\/+$/, '');
-  }
-
-  async request(path, { body, text = false } = {}) {
-    let response;
-    try {
-      response = await fetch(this.base + path, body === undefined ? {} : { method: 'POST', body });
-    } catch {
-      throw new ExplorerError(`cannot reach ${this.base}`, 0);
-    }
-    const answer = await response.text();
-    if (!response.ok) throw new ExplorerError(answer.slice(0, 300) || `${response.status} from the explorer`, response.status);
-    if (text) return answer.trim();
-    try {
-      return JSON.parse(answer);
-    } catch {
-      throw new ExplorerError('the explorer answered something that is not JSON', response.status);
-    }
-  }
-
-  /** The tip: its height and median time past, which T1 goes by. */
-  async tip() {
-    const hash = hexId(await this.request('/blocks/tip/hash', { text: true }));
-    if (!hash) throw new ExplorerError('the explorer named no tip', 0);
-    const block = await this.request(`/block/${hash}`);
-    return { height: int(block?.height), mtp: int(block?.mediantime) };
-  }
-
-  /** One output: missing, or its value and script, whether its transaction is in a block, and whether it is spent and by what. */
-  async out(txid, vout) {
-    let tx;
-    try {
-      tx = await this.request(`/tx/${txid}`);
-    } catch (e) {
-      if (e.status === 404 || e.status === 400) return { missing: true };
-      throw e;
-    }
-    const o = Array.isArray(tx?.vout) ? tx.vout[vout] : null;
-    const value = int(o?.value);
-    if (!o || value <= 0 || typeof o.scriptpubkey !== 'string') return { missing: true };
-    const spend = await this.request(`/tx/${txid}/outspend/${vout}`);
-    return {
-      value, script: o.scriptpubkey.toLowerCase(), confirmed: tx.status?.confirmed === true, height: int(tx.status?.block_height),
-      spent: spend?.spent === true, spender: hexId(spend?.txid), spenderConfirmed: spend?.status?.confirmed === true,
-    };
-  }
-
-  /** A transaction's status: whether the explorer knows it, and whether it is in a block. */
-  async txStatus(txid) {
-    try {
-      const s = await this.request(`/tx/${txid}/status`);
-      return { found: true, confirmed: s?.confirmed === true };
-    } catch (e) {
-      if (e.status === 404 || e.status === 400) return { found: false, confirmed: false };
-      throw e;
-    }
-  }
-
-  /** Sends a transaction; one the chain already has counts as sent. Throws otherwise, `refused` when Litecoin turned it down. */
-  async broadcast(txHex) {
-    try {
-      return await this.request('/tx', { body: txHex, text: true });
-    } catch (e) {
-      if (/already in (the )?(block ?chain|mempool)|txn-already-known|already known/i.test(e.message)) return null;
-      throw Object.assign(new Error(e.message), { refused: e.status === 400 });
-    }
-  }
-
-  /** LTC's price in USD, or null. */
-  async usd() {
-    try {
-      const answer = await this.request('/v1/prices');
-      const usd = Number(answer?.USD);
-      return Number.isFinite(usd) && usd > 0 ? usd : null;
-    } catch {
-      return null;
     }
   }
 }

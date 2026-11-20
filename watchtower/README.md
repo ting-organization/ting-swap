@@ -35,18 +35,24 @@ node watchtower/src/main.mjs --dry-run
 ```
 
 reads production as `LTC_PRODUCTION` in `web/js/config.js` pins it (node1, the HTLC
-program, Daler, Litecoin mainnet through litecoinspace.org), checks the program's and the
+program, Daler, Litecoin mainnet through litecoinspace.org and, while it cannot answer,
+the backups `explorers` names there, the zelcore Blockbook too, which answers no
+browser), checks the program's and the
 coin's CodeHashes as the page does, and prints what it would post, message and send,
 sending nothing and keeping nothing: it writes no state file, so the run after it posts
 and sends everything. Without `--dry-run`, it sends claims and refunds; without
 `DISCORD_TOKEN` it still only prints the feed and the reminders, and keeps no feed
 message or reminder as done, so that they go out once the token is there.
 
-Each round reads Ting, then at most 12 Litecoin outputs (two requests each), by the
-page's rules: one Litecoin did not have again after 5 minutes, one that pays another
-script or is spent in a block never again, the lock a claimed listing's signed claim
-spends every round until a spend of it is in a block, and the rest every 10 minutes, the
-least recently read first. The lock a claimed listing's signed claim spends comes
+Each round reads Ting, then, once every `LTC_POLL_SECONDS`, Litecoin's tip (one request
+while it does not move) and at most 12 Litecoin outputs (two requests each, one for an
+output 6 blocks deep, whose spend is all that can change), by the page's rules: one
+Litecoin did not have again after 5 minutes, one that pays another script or is spent in
+a block never again, the lock a claimed listing's signed claim spends every Litecoin
+read until a spend of it is in a block, and the rest every 10 minutes, the least
+recently read first. LTC's price, every 10 minutes, from litecoinspace.org, or Coinbase,
+then CoinGecko, while it has none from the last two hours; the feed shows no dollars
+when none of them has one. The lock a claimed listing's signed claim spends comes
 first. Then a claimed listing's locks never read, since its claim waits for all of them:
 shared out among the claimed listings, those with the fewest first (a real trade's one
 ahead of a listing with copies of its take posted for nothing), in turns, two a round
@@ -75,6 +81,7 @@ Settings, as environment variables:
 | `STATE_FILE` | Where it keeps who watches what, what it sent and the outputs it read; `watchtower-state.json` |
 | `PORT`, `HOST` | The interactions endpoint, `127.0.0.1:8787` by default, behind an HTTPS proxy |
 | `POLL_SECONDS` | Seconds between rounds, 15 by default |
+| `LTC_POLL_SECONDS` | Seconds between two reads of Litecoin, 60 by default (15 on a test setup); a block comes every 150 |
 | `DRY_RUN=1` | The same as `--dry-run` |
 
 The state file holds nothing secret; losing it loses only that bookkeeping (watchers,

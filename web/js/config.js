@@ -49,7 +49,18 @@ export const LTC_PRODUCTION = {
   node: 'https://node1.ting-node.com',
   htlc: 'bc0d789dc5b7338bd19d1e7d3723ed09b09885634063bba4389f7f2b2765447d',
   coin: '305378d17f6af84a563d0f8a8455084948aff7330b62b4f2f98a44b82ba113c4',
-  ltc: 'https://litecoinspace.org/api',
+  /**
+   * The Litecoin explorers (explorer.js), asked in this order while the one
+   * before cannot answer. Only the first is trusted with an accept. One with
+   * `browser: false` answers no browser (it sends no CORS headers): the
+   * watchtower's only. Blockcypher answers about 100 requests an hour.
+   */
+  explorers: [
+    { kind: 'esplora', base: 'https://litecoinspace.org/api', trusted: true },
+    { kind: 'blockbook', base: 'https://blockbook.ltc.zelcore.io/api', browser: false },
+    { kind: 'blockbook', base: 'https://litecoinblockexplorer.net/api' },
+    { kind: 'blockcypher', base: 'https://api.blockcypher.com/v1/ltc/main', perHour: 80, gap: 400 },
+  ],
   ltcnet: 'mainnet',
   wallet: 'https://wallet.ting-project.com/',
   confs: 3,
