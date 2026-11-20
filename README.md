@@ -24,7 +24,8 @@ It is three pieces, and a helper:
   browser, with no third-party code.
 - **The page** (`web/`): a static web client, plain HTML, CSS and JavaScript with no
   build step and no third-party code. It reads Ting from a node and Litecoin from an
-  Esplora-style explorer, keeps each trade's Litecoin key and secret in the browser,
+  Esplora-style explorer, with public backups while it cannot answer (HTLC.md,
+  "Explorer"), keeps each trade's Litecoin key and secret in the browser,
   and hands each Ting action that needs a signature to Ting ID as a TCR-1 call link.
 - **The watchtower** (`watchtower/`, [its README](watchtower/README.md)): a Node.js
   service with no key and no dependencies. It keeps a Discord feed of the listings,
@@ -92,7 +93,8 @@ Discord's in-app browser can lose what a page stores, so the page asks to be ope
 the real browser first.
 
 **For trading over chat.** *Copy for sharing* copies an overview of the trade for a
-chat: the amounts, the LTC in dollars at litecoinspace.org's price, where the trade
+chat: the amounts, the LTC in dollars at litecoinspace.org's price (or Coinbase's, then
+CoinGecko's, while it has none from the last two hours), where the trade
 stands, and its link. It never holds a key or the secret. DLR gets a dollar figure only
 next to a listing's rate (1 DLR ≈ $…): that listing's LTC per DLR at LTC's price, an
 estimate from the listing, not a price DLR has anywhere.

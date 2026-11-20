@@ -488,7 +488,26 @@ computer.
   a retry, and acts on nothing it could not read. Numbers and ids from the node or the
   explorer are checked before they reach the page.
 - **Explorer.** The page reads Litecoin from an Esplora-style API: litecoinspace.org, or
-  `scripts/ltc-dev.mjs` on a regtest chain.
+  `scripts/ltc-dev.mjs` on a regtest chain. On production, while litecoinspace.org cannot
+  answer (unreachable, a server error, too many requests), it asks the next of
+  `LTC_PRODUCTION.explorers` (`web/js/explorer.js`): a public Blockbook, then Blockcypher
+  within a budget of 80 requests an hour. Each request is tried three times, and an
+  explorer that fails twice in a row rests, 30 seconds at first and up to 10 minutes,
+  while the next ones answer. "No such transaction" is an answer, never asked again
+  elsewhere. Only litecoinspace.org is trusted with what a trade relies on: the seller's
+  page accepts a lock, and gives up on an accepted lock it cannot find, only on its
+  word, and what only a backup said waits for it. Median time past never goes back: an
+  explorer that cannot tell it (Blockcypher) leaves the last one read, which is never
+  later than the true one.
+- **How often.** Ting is read every 4 seconds while a trade is open or on screen, every
+  10 on the market. Litecoin, where a block comes every two and a half minutes, every 30
+  seconds while a trade is open or on screen, every 2 minutes on the market or while
+  backups answer, every 5 minutes while the page is hidden, and at once (but never
+  within 10 seconds of the last read) for something never read. A tip that did not
+  move costs one request. An output whose transaction is 6 blocks deep is read again only
+  for whether it is spent; one whose spend is 6 blocks deep, and a transaction 6 blocks
+  deep, not at all. Other buyers' locks are read again once a block while they wait for
+  one, else every 5 minutes.
 
 ## The watchtower
 

@@ -12,9 +12,11 @@
 import { createServer } from 'node:http';
 import { hex, unhex } from '../../web/js/bytes.js';
 import { CODE_HASHES, LTC_PRODUCTION } from '../../web/js/config.js';
+import { Explorer } from '../../web/js/explorer.js';
+import { MAX_PRICE_AGE, PRICE_SOURCES, readPrice } from '../../web/js/price.js';
 import { decodeCoin } from '../../web/js/swap.js';
 import { sendClaims, sendRefunds } from './act.mjs';
-import { Litecoin, Ting } from './chains.mjs';
+import { Ting } from './chains.mjs';
 import { answer, Discord, signedByDiscord } from './discord.mjs';
 import { outsInUse, readsDue } from './reads.mjs';
 import * as S from './state.mjs';
@@ -44,12 +46,16 @@ const config = {
   pageUrl: env.PAGE_URL ?? 'https://ting-organization.github.io/ting-swap/',
   feedMin: BigInt(Math.round(Number(env.FEED_MIN_LTC ?? '0.01') * 1e8)),
   poll: Number(env.POLL_SECONDS ?? 15) * 1000,
+  /** Litecoin is read at most this often: a block comes every two and a half minutes. */
+  ltcPoll: Number(env.LTC_POLL_SECONDS ?? (production ? 60 : 15)),
   port: Number(env.PORT ?? 8787),
   host: env.HOST ?? '127.0.0.1',
   discord: { token: env.DISCORD_TOKEN, applicationId: env.DISCORD_APPLICATION_ID, publicKey: env.DISCORD_PUBLIC_KEY, channel: env.DISCORD_CHANNEL },
 };
 
 const PRICE_EVERY = 600;
+/** An output whose transaction is this many blocks deep is not read again whole: only whether it is spent. */
+const SETTLED_DEPTH = 6;
 
 const now = () => Math.floor(Date.now() / 1000);
 const log = (text) => console.log(`${new Date().toISOString()} ${text}`);
@@ -57,7 +63,9 @@ const log = (text) => console.log(`${new Date().toISOString()} ${text}`);
 const program = unhex(setup.htlc);
 const coinId = unhex(setup.coin);
 const ting = new Ting({ node: setup.node, program });
-const litecoin = new Litecoin(setup.ltc);
+// Production asks every explorer config.js names, in turn, browsers' or not; a test setup, its own only.
+const litecoin = new Explorer(production ? setup.explorers : [{ kind: 'esplora', base: setup.ltc, trusted: true }]);
+const priceSources = production ? PRICE_SOURCES : [];
 const discord = new Discord({ ...config.discord, dryRun: config.dryRun, log });
 const state = S.load(config.statePath);
 /** The outputs read, by outpoint, `{ out, at }`: kept in the state, so that a restart reads nothing again it need not. */
@@ -67,9 +75,13 @@ let trades = new Map();
 /** Whether the listings were read once: before that, no read can be told useless. */
 let read = false;
 let coin = null;
-let usd = null;
-let usdAt = 0;
+/** LTC's price as last read, `{ usd, time }`: shown only while at most MAX_PRICE_AGE old. */
+let price = null;
+let priceAt = 0;
 let ltcTip = null;
+/** When Litecoin was last read, and through which explorer. */
+let ltcAt = 0;
+let ltcVia = null;
 let saved = null;
 /** Rounds run, for the turns readsDue gives listings. */
 let rounds = 0;
@@ -118,8 +130,10 @@ const outOf = (lock) => (lock ? outs.get(lock.key)?.out : undefined);
 const claimOfTrade = (trade) => claimOf(trade, program, setup.ltcnet, outOf);
 
 async function readOut(lock) {
+  const kept = outs.get(lock.key)?.out;
+  const settled = kept && !kept.missing && kept.confirmed && ltcTip && ltcTip.height - kept.height + 1 >= SETTLED_DEPTH;
   try {
-    outs.set(lock.key, { out: await litecoin.out(lock.txid, lock.vout), at: now() });
+    outs.set(lock.key, { out: await litecoin.out(lock.txid, lock.vout, settled ? kept : undefined), at: now() });
     failed.delete(lock.key);
   } catch (e) {
     failed.set(lock.key, now());
@@ -127,16 +141,34 @@ async function readOut(lock) {
   }
 }
 
-/** Reads what this round needs of Litecoin (reads.mjs). */
+/**
+ * Reads what this round needs of Litecoin (reads.mjs), at most every
+ * ltcPoll seconds, and LTC's price every PRICE_EVERY. The tip's median time
+ * past never goes back: an explorer that cannot tell it leaves the last one.
+ */
 async function readLitecoin() {
-  ltcTip = await litecoin.tip().catch((e) => { log(`cannot read Litecoin's tip: ${e.message}`); return ltcTip; });
-  if (now() - usdAt > PRICE_EVERY) {
-    usd = (await litecoin.usd()) ?? usd;
-    usdAt = now();
+  if (now() - priceAt >= PRICE_EVERY) {
+    priceAt = now();
+    price = (await readPrice(priceSources, { maxAge: MAX_PRICE_AGE })) ?? price;
+  }
+  if (now() - ltcAt < config.ltcPoll) return;
+  ltcAt = now();
+  try {
+    const tip = await litecoin.tip();
+    ltcTip = { ...tip, mtp: Math.max(tip.mtp ?? 0, ltcTip?.mtp ?? 0) };
+  } catch (e) {
+    log(`cannot read Litecoin's tip: ${e.message}`);
+  }
+  if (litecoin.last !== ltcVia) {
+    ltcVia = litecoin.last;
+    log(`reading Litecoin through ${ltcVia.name}${ltcVia === litecoin.primary ? '' : `, as ${litecoin.primary.name} cannot answer`}`);
   }
   rounds++;
   for (const lock of readsDue({ trades, program, net: setup.ltcnet, outs, failed, now: now(), claimOf: claimOfTrade, round: rounds })) await readOut(lock);
 }
+
+/** LTC's price in USD while it is recent enough to show, or null. */
+const usd = () => (price && now() - price.time <= MAX_PRICE_AGE ? price.usd : null);
 
 /** Whether a buyer's lock pays an open listing and is not spent: released and taken back, it is no lock any more. */
 const lockedNow = (trade) => trade.takes.some((take) => {
@@ -176,7 +208,7 @@ function tell() {
   telling = (async () => {
     try {
       await updateFeed({
-        trades, state, discord, printed: printedFeed, coin, usd, pageUrl: config.pageUrl, feedMin: config.feedMin,
+        trades, state, discord, printed: printedFeed, coin, usd: usd(), pageUrl: config.pageUrl, feedMin: config.feedMin,
         channel: config.discord.channel, lockedNow, log,
       });
       await sendNotes({ trades, state, discord, printed: printedNotes, viewOf: view, now: now(), log });

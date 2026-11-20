@@ -1,6 +1,6 @@
 // Ting Swap for Litecoin, the page (HTLC.md, "The page"): DLR on Ting for LTC
 // on Litecoin, with nobody sending first. It reads Ting through one node and
-// Litecoin through an Esplora-style explorer, keeps this browser's keys and
+// Litecoin through public explorers (explorer.js), keeps this browser's keys and
 // secrets (ltc-keys.js), and hands the seller's Ting actions to Ting ID as
 // TCR-1 call links. Everything else it sends itself: takes, claims, releases
 // and refunds on Ting, which need no signature, and the Litecoin claim,
@@ -11,9 +11,11 @@
 // regtest or testnet.
 import { equal, hex, Reader, unhex } from './bytes.js';
 import { CODE_HASHES, LTC_PRODUCTION } from './config.js';
+import { Explorer } from './explorer.js';
 import * as H from './htlc.js';
 import * as K from './ltc-keys.js';
 import * as L from './ltc.js';
+import { MAX_PRICE_AGE, PRICE_SOURCES, plainSource, readPrice as readPriceFrom } from './price.js';
 import { qrSvg } from './qr.js';
 import { isPublicKey, publicKey } from './secp256k1.js';
 import { claimFee as claimFeeNow, twoDigits } from './fees.js';
@@ -56,9 +58,25 @@ const LTC_NETS = ['regtest', 'testnet'];
 const ACCEPT_TIME = 18 * 3600;
 /** The seller's page wants at least this much of that time left, so an accept is not refused for a few seconds. */
 const CHECK_MARGIN = 600;
-/** How often a trade is read again from both chains while it is open, and the market. */
+/** How often Ting is read while a trade is open or on screen, and on the market. */
 const TRADE_POLL = 4000;
 const MARKET_POLL = 10_000;
+/**
+ * How often Litecoin is read, in seconds: while a trade of this browser is
+ * open or one is on screen, on the market, while the page is hidden, and while
+ * the first explorer rests and backups answer within their budgets. A block
+ * comes every two and a half minutes. Something never read is read at once,
+ * but never sooner than LTC_MIN_GAP after the last read.
+ */
+const LTC_TRADE_POLL = 30;
+const LTC_MARKET_POLL = 120;
+const LTC_HIDDEN_POLL = 300;
+const LTC_BACKUP_POLL = 120;
+const LTC_MIN_GAP = 10;
+/** An output or a transaction this many blocks deep is not read again whole: only whether it is spent, or nothing. */
+const SETTLED_DEPTH = 6;
+/** An open take's lock that no claim of this browser waits for is read again after this long, or once a block while it waits for one. */
+const REST_AGAIN = 300;
 /** A transaction the page sent that no node or explorer knows after this many seconds is sent again. */
 const RESEND_AFTER = 30;
 /**
@@ -93,59 +111,16 @@ const MISSING_AGAIN = 300;
 /** Inside Discord's own browser, which can lose what a page keeps. */
 const DISCORD = /discord/i.test(navigator.userAgent);
 /**
- * Where the page reads LTC's price in USD, for an estimate next to LTC
- * amounts; `price` in the address names another source of the same shape, or
- * `off`. Read this often, kept in this browser, and shown only while at most
- * this old. Never a price for DLR.
+ * LTC's price in USD, for an estimate next to LTC amounts (price.js): read
+ * this often, kept in this browser, and shown only while at most MAX_PRICE_AGE
+ * old. `price` in a test setup's address names one source of
+ * litecoinspace.org's shape instead, or `off`. Never a price for DLR.
  */
-const PRICE_URL = 'https://litecoinspace.org/api/v1/prices';
 const PRICE_EVERY = 10 * 60_000;
-const PRICE_AGE = 2 * 3600;
 const PRICE_KEY = 'ting-swap/ltc-usd';
 
 /** Thrown to stop an action the user turned down: nothing to report. */
 class Quiet extends Error {}
-
-class ExplorerError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.status = status;
-  }
-}
-
-/** The part of an Esplora API the page reads (litecoinspace.org, or scripts/ltc-dev.mjs on regtest). */
-class Esplora {
-  constructor(base) {
-    this.base = base.replace(/\/+$/, '');
-  }
-
-  async request(path, { body, text = false } = {}) {
-    let response;
-    try {
-      response = await fetch(this.base + path, body === undefined ? { cache: 'no-store' } : { method: 'POST', body, cache: 'no-store' });
-    } catch {
-      throw new ExplorerError(`cannot reach ${this.base}`, 0);
-    }
-    const answer = await response.text();
-    if (!response.ok) throw new ExplorerError(answer.slice(0, 300) || `${response.status} from the explorer`, response.status);
-    if (text) return answer.trim();
-    try {
-      return JSON.parse(answer);
-    } catch {
-      throw new ExplorerError('the explorer answered something that is not JSON', response.status);
-    }
-  }
-
-  tx(txid) { return this.request(`/tx/${txid}`); }
-  txStatus(txid) { return this.request(`/tx/${txid}/status`); }
-  outspend(txid, vout) { return this.request(`/tx/${txid}/outspend/${vout}`); }
-  utxo(address) { return this.request(`/address/${encodeURIComponent(address)}/utxo`); }
-  addressTxs(address) { return this.request(`/address/${encodeURIComponent(address)}/txs`); }
-  tipHash() { return this.request('/blocks/tip/hash', { text: true }); }
-  block(hash) { return this.request(`/block/${hash}`); }
-  fees() { return this.request('/v1/fees/recommended'); }
-  broadcast(txHex) { return this.request('/tx', { body: txHex, text: true }); }
-}
 
 const app = {
   node: null,
@@ -179,10 +154,12 @@ const app = {
   tingError: null,
   /**
    * Litecoin as last read: the tip, outputs by `txid:vout` (each with `at`, when
-   * it was read), unspent outputs by address, transactions' status by id, and
-   * what failed to read in the last round, by the same keys.
+   * it was read, the tip's height then, and `trusted`, whether the first
+   * explorer said so), unspent outputs by address, transactions' status by id,
+   * what failed to read in the last round, by the same keys, and when Litecoin
+   * was last read; `force` reads it in the next round, whenever it was.
    */
-  lt: { tip: null, outs: new Map(), utxos: new Map(), txs: new Map(), error: null, failed: new Map() },
+  lt: { tip: null, outs: new Map(), utxos: new Map(), txs: new Map(), error: null, failed: new Map(), at: 0, force: false },
   /** What each trade's automatic steps last could not do, by listing. */
   actionErrors: new Map(),
   /** What the current view does every second, when data changes, and what it reads every few seconds. */
@@ -193,9 +170,9 @@ const app = {
   /** Actions in flight, so that none starts twice. */
   busy: new Set(),
   discordOk: false,
-  /** LTC's price in USD as last read, `{ url, usd, time, read }`, and its source; '' for none. */
+  /** LTC's price in USD as last read, `{ url, usd, time, read }`, and its sources (price.js), in order; none for no price. */
   price: null,
-  priceUrl: '',
+  priceSources: [],
   /** What the current view does when a new price arrives, when not `onData`. */
   onPrice: null,
 };
@@ -221,7 +198,7 @@ const rateText = (amount, want) => `1 ${esc(app.dlr.symbol)} = ${rate(BigInt(amo
 const rateBack = (amount, want) => `1 LTC = ${rate(BigInt(want), 8, BigInt(amount), app.dlr.decimals)} ${esc(app.dlr.symbol)}`;
 
 /** The LTC price while it is recent enough to show, or null. */
-const livePrice = () => (app.price && now() - app.price.time <= PRICE_AGE ? app.price : null);
+const livePrice = () => (app.price && now() - app.price.time <= MAX_PRICE_AGE ? app.price : null);
 
 /** "≈ $21.95" for an LTC amount in litoshi, or nothing without a recent price. LTC only: a DLR amount has no price of its own (rateUsd gives what a listing's rate makes of one). */
 function usd(litoshi) {
@@ -643,57 +620,33 @@ function signedClaimOf(d, lock, out) {
 
 // ---- Reading Litecoin ------------------------------------------------------
 
+/** The tip. Its median time past never goes back: an explorer that cannot tell it leaves the last one read, which is never later than the true one. */
 async function readTip() {
-  const hash = hexId(await app.ltc.tipHash());
-  if (!hash) throw new ExplorerError('the explorer named no tip', 0);
-  const block = await app.ltc.block(hash);
-  app.lt.tip = { height: int(block?.height), hash, mtp: int(block?.mediantime), time: int(block?.timestamp) };
+  const tip = await app.ltc.tip();
+  app.lt.tip = { ...tip, mtp: Math.max(int(tip.mtp), app.lt.tip?.mtp ?? 0) };
 }
 
-/** One output as the explorer has it, with when it was read: missing, or its value and script, its block and whether it is spent. */
+/** Whether an output's transaction is SETTLED_DEPTH deep: what it pays no longer changes, only whether it is spent. */
+const ltcSettled = (o) => Boolean(o && !o.missing && o.confirmed && ltcDepth(o.height) >= SETTLED_DEPTH);
+
+/** One output as an explorer has it (explorer.js), with when it was read and the tip's height then. */
 async function readOut(txidHex, vout) {
   const key = `${txidHex}:${vout}`;
-  let tx;
-  try {
-    tx = await app.ltc.tx(txidHex);
-  } catch (e) {
-    if (e.status === 404 || e.status === 400) {
-      app.lt.outs.set(key, { missing: true, at: now() });
-      return;
-    }
-    throw e;
-  }
-  const out = Array.isArray(tx?.vout) ? tx.vout[vout] : null;
-  const value = int(out?.value);
-  if (!out || value <= 0 || typeof out.scriptpubkey !== 'string') {
-    app.lt.outs.set(key, { missing: true, at: now() });
-    return;
-  }
-  const spend = await app.ltc.outspend(txidHex, vout);
-  app.lt.outs.set(key, {
-    value, script: out.scriptpubkey.toLowerCase(), confirmed: tx.status?.confirmed === true, height: int(tx.status?.block_height),
-    spent: spend?.spent === true, spender: hexId(spend?.txid), spenderConfirmed: spend?.status?.confirmed === true,
-    spenderHeight: int(spend?.status?.block_height), at: now(),
-  });
+  const kept = app.lt.outs.get(key);
+  const out = await app.ltc.out(txidHex, vout, ltcSettled(kept) ? kept : undefined);
+  app.lt.outs.set(key, { ...out, at: now(), tipHeight: app.lt.tip?.height ?? 0 });
 }
 
 async function readTxStatus(id) {
-  try {
-    const s = await app.ltc.txStatus(id);
-    app.lt.txs.set(id, { found: true, confirmed: s?.confirmed === true, height: int(s?.block_height) });
-  } catch (e) {
-    if (e.status !== 404 && e.status !== 400) throw e;
-    app.lt.txs.set(id, { found: false });
-  }
+  app.lt.txs.set(id, await app.ltc.txStatus(id));
 }
 
-/** The unspent outputs at an address, as the explorer lists them, each checked to be one. */
+/** The unspent outputs at an address, as an explorer lists them, each checked to be one. */
 async function readUtxos(address) {
-  const list = await app.ltc.utxo(address);
-  app.lt.utxos.set(address, (Array.isArray(list) ? list : []).map((u) => ({
-    txid: hexId(u?.txid), vout: int(u?.vout), value: int(u?.value),
-    status: { confirmed: u?.status?.confirmed === true, block_height: int(u?.status?.block_height) },
-  })).filter((u) => u.txid && u.value > 0));
+  const list = await app.ltc.utxos(address);
+  app.lt.utxos.set(address, list.filter((u) => u.txid && u.value > 0).map((u) => ({
+    txid: u.txid, vout: u.vout, value: u.value, status: { confirmed: u.confirmed, block_height: u.height },
+  })));
 }
 
 /**
@@ -704,6 +657,8 @@ async function readUtxos(address) {
  * says only that Litecoin could not be read at all.
  */
 async function refreshLtc(first = {}, rest = {}) {
+  app.lt.at = now();
+  app.lt.force = false;
   try {
     await readTip();
     app.lt.error = null;
@@ -738,7 +693,7 @@ const outOf = (txidHex, vout) => app.lt.outs.get(`${txidHex}:${vout}`);
 async function feeRate() {
   if (app.ltcFee) return app.ltcFee;
   try {
-    const fastest = Number((await app.ltc.fees())?.fastestFee);
+    const fastest = Number(await app.ltc.feeRate());
     if (!Number.isFinite(fastest) || fastest <= 0) return 2;
     return Math.min(MAX_FEE_RATE, Math.max(2, Math.ceil(fastest)));
   } catch {
@@ -747,16 +702,15 @@ async function feeRate() {
 }
 
 /**
- * Sends a Litecoin transaction; one the chain already has counts as sent.
- * Throws otherwise, with `refused` when Litecoin itself turned it down, not
- * when the explorer could not be reached.
+ * Sends a Litecoin transaction through the first explorer that can take it;
+ * one the chain already has counts as sent. Throws otherwise, with `refused`
+ * when Litecoin itself turned it down, not when no explorer could be reached.
  */
 async function broadcast(txHex) {
   try {
     return await app.ltc.broadcast(txHex);
   } catch (e) {
-    if (/already in (the )?(block ?chain|mempool)|txn-already-known|already known/i.test(e.message)) return null;
-    throw Object.assign(new Error(ltcWords(e)), { refused: e.status === 400 });
+    throw Object.assign(new Error(ltcWords(e)), { refused: e.refused });
   }
 }
 
@@ -766,6 +720,7 @@ async function broadcast(txHex) {
  * the output it names exists, pays that script's address at least the wanted
  * amount, has enough confirmations and is unspent, and T1 leaves the gap.
  * From what Litecoin was last read as: `{ state: 'ok' | 'wait' | 'bad' | 'unknown', words }`.
+ * Ready only on the first explorer's word: what only a backup said waits.
  */
 function checkTake(terms, take) {
   const lock = lockScript(terms, take);
@@ -780,6 +735,7 @@ function checkTake(terms, take) {
   const depth = out.confirmed ? ltcDepth(out.height) : 0;
   const counted = `${ltcText(out.value)} LTC locked, ${depth} of ${app.confs} confirmation${app.confs === 1 ? '' : 's'}`;
   if (depth < app.confs) return { state: 'wait', words: `${counted}: waiting for confirmations`, lock, out, depth };
+  if (!out.trusted) return { state: 'wait', words: `${counted}, as a backup explorer says: waiting to check it through ${app.ltc.primary.name}`, lock, out, depth };
   return { state: 'ok', words: `${counted}: ready`, lock, out, depth };
 }
 
@@ -795,42 +751,36 @@ function markSetup() {
 
 // ---- LTC's price in USD ------------------------------------------------------
 
-/** The price source the address names: `price=off` for none, another http(s) URL, or litecoinspace.org's. */
-function priceSource(query) {
+/** The price sources the address names: `price=off` for none, another http(s) URL of litecoinspace.org's shape, or price.js's line. */
+function priceSources(query) {
   const p = query.get('price');
-  if (p === 'off') return '';
-  if (!p) return PRICE_URL;
+  if (p === 'off') return [];
+  if (!p) return PRICE_SOURCES;
   try {
     const url = new URL(p);
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+    return url.protocol === 'https:' || url.protocol === 'http:' ? [plainSource(url.href)] : [];
   } catch {
-    return '';
+    return [];
   }
 }
 
-/** The last good price from this source that this browser kept, or null. */
+/** The last good price from one of these sources that this browser kept, or null. */
 function savedPrice() {
   try {
     const p = JSON.parse(localStorage.getItem(PRICE_KEY) ?? 'null');
-    if (p && p.url === app.priceUrl && Number.isFinite(p.usd) && p.usd > 0 && Number.isInteger(p.time) && Number.isInteger(p.read)) return p;
+    if (p && app.priceSources.some((s) => s.url === p.url) && Number.isFinite(p.usd) && p.usd > 0 && Number.isInteger(p.time) && Number.isInteger(p.read)) return p;
   } catch { /* none kept */ }
   return null;
 }
 
-/** Reads the price, `{ "time": …, "USD": … }`, and keeps a good one. A failure is quiet: the page then shows no USD. */
+/** Reads the price from the first source with a recent one, and keeps it. A failure is quiet: the page then shows no USD. */
 async function readPrice() {
-  if (!app.priceUrl) return;
-  try {
-    const response = await fetch(app.priceUrl, { cache: 'no-store', credentials: 'omit' });
-    if (!response.ok) return;
-    const answer = await response.json();
-    const usd = Number(answer?.USD);
-    const time = Number(answer?.time);
-    if (!(Number.isFinite(usd) && usd > 0 && Number.isInteger(time) && time > 0)) return;
-    app.price = { url: app.priceUrl, usd, time, read: now() };
-    try { localStorage.setItem(PRICE_KEY, JSON.stringify(app.price)); } catch { /* kept for this visit only */ }
-    (app.onPrice ?? app.onData)?.();
-  } catch { /* no USD until a later read works */ }
+  if (!app.priceSources.length) return;
+  const p = await readPriceFrom(app.priceSources, { maxAge: MAX_PRICE_AGE });
+  if (!p) return;
+  app.price = { ...p, read: now() };
+  try { localStorage.setItem(PRICE_KEY, JSON.stringify(app.price)); } catch { /* kept for this visit only */ }
+  (app.onPrice ?? app.onData)?.();
 }
 
 /** Reads what a claim pays now. A failure is quiet: the page then sets the least cap. */
@@ -1464,9 +1414,10 @@ function needsOf(d, t) {
  * Which of these locks to read this round: at most `cap`, those never read
  * first, then those read longest ago. A lock missing from Litecoin is read
  * again only after MISSING_AGAIN; an output that pays none of the scripts its
- * takes name, or is spent in a block, never again. Takes and copied listings
- * cost little to make: however many there are, they take at most `cap` reads
- * a round, and each gets its turn.
+ * takes name, or is spent in a block, never again; one waiting for a block
+ * (its own, or its spend's) once the tip moved; any other after REST_AGAIN.
+ * Takes and copied listings cost little to make: however many there are,
+ * they take at most `cap` reads a round, and each gets its turn.
  */
 function pickRest(locks, cap = OTHER_READS) {
   const byKey = new Map();
@@ -1479,10 +1430,39 @@ function pickRest(locks, cap = OTHER_READS) {
     else if (o.missing) when = now() - o.at > MISSING_AGAIN ? o.at : null;
     else if (!group.some((l) => o.script === hex(l.scriptPubKey))) when = null;
     else if (o.spent && o.spenderConfirmed) when = null;
-    else when = o.at ?? 0;
+    else {
+      const waiting = !o.confirmed || o.spent;
+      when = (waiting && o.tipHeight !== app.lt.tip?.height) || now() - o.at >= REST_AGAIN ? o.at ?? 0 : null;
+    }
     if (when != null) due.push([when, group[0]]);
   }
   return due.sort((a, b) => a[0] - b[0]).slice(0, cap).map(([, l]) => [l.txid, l.vout]);
+}
+
+/** Whether an output's spend is in a block SETTLED_DEPTH deep: nothing about it changes any more. */
+const spendSettled = (o) => Boolean(o?.spent && o.spenderConfirmed && ltcDepth(o.spenderHeight) >= SETTLED_DEPTH);
+
+/** Seconds between two reads of Litecoin now (LTC_TRADE_POLL and the rest). */
+function ltcEvery(active) {
+  let every = active ? LTC_TRADE_POLL : LTC_MARKET_POLL;
+  if (document.hidden) every = Math.max(every, LTC_HIDDEN_POLL);
+  if (app.ltc.resting) every = Math.max(every, LTC_BACKUP_POLL);
+  return every;
+}
+
+/**
+ * Whether this round reads Litecoin: when asked to, when something `first`
+ * names was never read (nor failed), or when the last read is ltcEvery old;
+ * never sooner than LTC_MIN_GAP after it. Ting is read every round.
+ */
+function ltcDue(first, active) {
+  if (app.lt.force) return true;
+  const since = now() - app.lt.at;
+  if (since < LTC_MIN_GAP) return false;
+  const unread = (key, map) => !map.has(key) && !app.lt.failed.has(key);
+  if (first.outs.some(([txidHex, vout]) => unread(`${txidHex}:${vout}`, app.lt.outs))) return true;
+  if (first.txs.some((id) => unread(id, app.lt.txs)) || first.addresses.some((a) => unread(a, app.lt.utxos))) return true;
+  return since >= ltcEvery(active);
 }
 
 /** Whether a listing of a trade of this browser still has something for the page to do or watch. */
@@ -1538,13 +1518,15 @@ async function round() {
   // The followed listings' accepted locks take their turns ahead of other takes, so that a seller's own
   // listing among copies is read within a few rounds however many copies there are.
   for (const [txidHex, vout] of pickRest(followed.filter((l) => !outs.has(outKey(l))))) outs.set(`${txidHex}:${vout}`, [txidHex, vout]);
+  // What is settled is not read again: a spend in a block SETTLED_DEPTH deep, a transaction as deep.
   const first = {
-    outs: [...outs.values()],
+    outs: [...outs.values()].filter(([txidHex, vout]) => !spendSettled(outOf(txidHex, vout))),
     addresses: [...new Set(firsts.flatMap((f) => f.addresses))],
-    txs: [...new Set(firsts.flatMap((f) => f.txs))],
+    txs: [...new Set(firsts.flatMap((f) => f.txs))].filter((id) => !(app.lt.txs.get(id)?.confirmed && ltcDepth(app.lt.txs.get(id).height) >= SETTLED_DEPTH)),
   };
-  await refreshLtc(first, { outs: pickRest(rests).filter(([txidHex, vout]) => !outs.has(`${txidHex}:${vout}`)) });
-  app.readEvery = jobs.length || app.viewing != null ? TRADE_POLL : MARKET_POLL;
+  const active = jobs.length > 0 || app.viewing != null;
+  if (ltcDue(first, active)) await refreshLtc(first, { outs: pickRest(rests).filter(([txidHex, vout]) => !outs.has(`${txidHex}:${vout}`)) });
+  app.readEvery = active ? TRADE_POLL : MARKET_POLL;
   if (!K.seed()) return;
   const tingRead = !app.tingError;
   const ltcRead = !app.lt.error;
@@ -1576,13 +1558,14 @@ function noteFinished(d, t) {
     if (d.accepted && !t.droppedIn?.[d.id] && app.lt.tip && app.lt.tip.mtp > d.accepted.t1) {
       const take = acceptedTake(d, t);
       const o = take && outOf(take.lockOf.txid, take.lockOf.vout);
-      if (!take || o?.missing) update(t, { droppedIn: { ...(t.droppedIn ?? {}), [d.id]: true } });
+      // Only on the first explorer's word: a backup that has not seen the lock ends nothing.
+      if (!take || (o?.missing && o.trusted)) update(t, { droppedIn: { ...(t.droppedIn ?? {}), [d.id]: true } });
     }
     if (!d.withdrawn || d.accepted || t.releasedIn?.[d.id]) return;
     const open = d.takes.some((x) => {
       const c = checkTake(d.terms, x);
       if (!c.lock) return false;
-      if (!c.out) return true;
+      if (!c.out || (c.out.missing && !c.out.trusted)) return true;
       return !c.out.missing && !c.out.spent && c.out.script === hex(c.lock.scriptPubKey) && !releaseOf(d, x);
     });
     if (!open) update(t, { releasedIn: { ...(t.releasedIn ?? {}), [d.id]: true } });
@@ -1771,7 +1754,7 @@ function renderMarket(main) {
 }
 
 function wireCommon(main) {
-  $$('[data-retry]', main).forEach((b) => (b.onclick = () => read()));
+  $$('[data-retry]', main).forEach((b) => (b.onclick = () => { app.lt.force = true; read(); }));
   $$('[data-reoffer]', main).forEach((b) => (b.onclick = () => guard(async () => {
     const t = myTrades().find((x) => x.n === Number(b.dataset.reoffer));
     if (t && !t.listing) await offer(t);
@@ -2011,7 +1994,7 @@ function tradeHtml(id, form) {
   if (d.buyer) panels.push(buyerPanel(d, d.buyer, form));
   if (!d.seller && !d.buyer) panels.push(d.open && !d.accepted ? offerPanel(d, form) : watchPanel(d));
   const panelsHtml = panels.join('');
-  const ltcNote = app.lt.error ? `<div class="callout bad">${icon('alert')}<div><b>Cannot read Litecoin right now.</b> ${esc(app.lt.error)}. The page tries again every few seconds. <button class="link" data-retry>Retry now</button></div></div>` : '';
+  const ltcNote = app.lt.error ? `<div class="callout bad">${icon('alert')}<div><b>Cannot read Litecoin right now.</b> ${esc(app.lt.error)}. No explorer, first or backup, answered: the page tries again shortly. <button class="link" data-retry>Retry now</button></div></div>` : '';
   return `${banners()}${ltcNote}
     <a class="back" href="#/">${icon('back')} Market</a>
     <div class="detail-grid">
@@ -3047,7 +3030,7 @@ function renderAbout(main) {
     </ul>
     <h2>${app.production ? 'What this page runs on' : 'This test setup'}</h2>
     <p>${app.production ? 'This page runs on Ting’s production network and Litecoin mainnet.' : `This page runs only on the Ting development chain and on Litecoin ${esc(app.net)}: no coin here is real.`} It
-    reads Ting through <code>${esc(app.node.base)}</code> and Litecoin through <code>${esc(app.ltc.base)}</code>, and
+    reads Ting through <code>${esc(app.node.base)}</code> and Litecoin through <code>${esc(app.ltc.base)}</code>${app.ltc.backends.length > 1 ? ` (while it cannot answer, through ${app.ltc.names.slice(1).map((n) => `<code>${esc(n)}</code>`).join(' or ')}, whose word alone accepts no lock)` : ''}, and
     checks the program’s code before making any call link.</p>
     <dl class="lines facts">
       <div><dt>HTLC program</dt><dd><code>${esc(hex(app.program))}</code></dd></div>
@@ -3190,8 +3173,7 @@ async function restore(seedBytes, account = null) {
     let chosen = null;
     for (const c of candidates.slice(0, 5)) {
       try {
-        const txs = await app.ltc.addressTxs(c.address);
-        if (Array.isArray(txs) && txs.length) {
+        if (await app.ltc.used(c.address)) {
           chosen = c;
           break;
         }
@@ -3345,7 +3327,10 @@ async function boot() {
   if (!app.program || !app.coin) return fatal('The address is missing an id', 'It needs <code>htlc</code>, the program’s ContractId, and <code>coins</code>, the DLR coin’s.');
   app.vault = contractAccount(app.program);
   app.wallet = setup.wallet ? safeUrl(setup.wallet) : '';
-  app.ltc = new Esplora(safeUrl(setup.ltc));
+  // Production asks config.js's explorers in turn (those a browser can ask); a test setup, its own only.
+  app.ltc = new Explorer(app.production
+    ? setup.explorers.filter((x) => x.browser !== false)
+    : [{ kind: 'esplora', base: safeUrl(setup.ltc), trusted: true }]);
   app.ltcWallet = app.net === 'regtest' ? new URL('/', app.ltc.base).href : '';
   const param = (name, fallback, min, max) => {
     const v = Number(query.get(name));
@@ -3386,9 +3371,9 @@ async function boot() {
     if (b) copy(b.dataset.copy, b.dataset.done ?? 'Copied');
   });
   // LTC's price: the one kept from before at once, then read now and every ten minutes.
-  app.priceUrl = priceSource(app.production ? new URLSearchParams() : query);
-  app.price = app.priceUrl ? savedPrice() : null;
-  if (app.priceUrl) {
+  app.priceSources = priceSources(app.production ? new URLSearchParams() : query);
+  app.price = app.priceSources.length ? savedPrice() : null;
+  if (app.priceSources.length) {
     readPrice();
     setInterval(readPrice, PRICE_EVERY);
   }
